@@ -15,7 +15,8 @@
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+# Single GPU override (much slower than the reference 8-GPU run)
+export NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
