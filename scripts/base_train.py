@@ -57,6 +57,9 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="explicit num
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
+parser.add_argument("--optimizer", type=str, default="nanochat", choices=["nanochat", "sgd", "adamw"], help="optimizer backend: native nanochat mixed optimizer, or a standard torch optimizer")
+parser.add_argument("--optimizer-lr", type=float, default=-1.0, help="global LR for standard torch optimizers such as SGD/AdamW (-1 = backend default)")
+parser.add_argument("--optimizer-momentum", type=float, default=0.9, help="momentum for SGD-like optimizers")
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
@@ -304,8 +307,9 @@ if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# Initialize the optimizer
 optimizer = model.setup_optimizer(
+    optimizer_name=args.optimizer,
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
@@ -313,6 +317,9 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    # Standard torch optimizer hyperparameters
+    optimizer_lr=args.optimizer_lr * batch_lr_scale if args.optimizer_lr > 0 else args.optimizer_lr,
+    optimizer_momentum=args.optimizer_momentum,
 )
 
 if resuming:

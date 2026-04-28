@@ -50,6 +50,9 @@ parser.add_argument("--max-seq-len", type=int, default=None, help="max context l
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
 parser.add_argument("--total-batch-size", type=int, default=None, help="total batch size in tokens (default: inherit from pretrain)")
 # Optimization (default: inherit from pretrained checkpoint)
+parser.add_argument("--optimizer", type=str, default="nanochat", choices=["nanochat", "sgd", "adamw"], help="optimizer backend")
+parser.add_argument("--optimizer-lr", type=float, default=-1.0, help="global LR for standard torch optimizers such as SGD/AdamW (-1 = backend default)")
+parser.add_argument("--optimizer-momentum", type=float, default=0.9, help="momentum for SGD-like optimizers")
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for matrix parameters (Muon) (default: inherit from pretrain)")
@@ -131,7 +134,15 @@ token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+optimizer = model.setup_optimizer(
+    optimizer_name=args.optimizer,
+    unembedding_lr=args.unembedding_lr,
+    embedding_lr=args.embedding_lr,
+    matrix_lr=args.matrix_lr,
+    weight_decay=0.0,
+    optimizer_lr=args.optimizer_lr,
+    optimizer_momentum=args.optimizer_momentum,
+)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the

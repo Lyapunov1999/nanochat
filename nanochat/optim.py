@@ -3,14 +3,40 @@ A nice and efficient mixed AdamW/Muon Combined Optimizer.
 Usually the embeddings and scalars go into AdamW, and the matrix parameters go into Muon.
 Two versions are provided (MuonAdamW, DistMuonAdamW), for single GPU and distributed.
 
+This module also exposes a small optimizer registry so training entrypoints can
+select between the native nanochat optimizer stack and standard torch optimizers
+without changing the training loop.
+
 Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
+from collections.abc import Callable
 import torch
 import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
+
+OptimizerBuilder = Callable[..., torch.optim.Optimizer]
+OPTIMIZER_REGISTRY: dict[str, OptimizerBuilder] = {}
+
+def register_optimizer(name: str):
+    """Register an optimizer builder under a stable CLI name."""
+    def decorator(fn: OptimizerBuilder) -> OptimizerBuilder:
+        OPTIMIZER_REGISTRY[name] = fn
+        return fn
+    return decorator
+
+def build_optimizer(name: str, model, ddp: bool, **kwargs) -> torch.optim.Optimizer:
+    """Instantiate an optimizer from the registry and stamp initial LR metadata."""
+    if name not in OPTIMIZER_REGISTRY:
+        available = ", ".join(sorted(OPTIMIZER_REGISTRY))
+        raise ValueError(f"Unknown optimizer '{name}'. Available: {available}")
+    optimizer = OPTIMIZER_REGISTRY[name](model=model, ddp=ddp, **kwargs)
+    for group in optimizer.param_groups:
+        group.setdefault("kind", name)
+        group["initial_lr"] = group["lr"]
+    return optimizer
 
 # -----------------------------------------------------------------------------
 """
@@ -533,3 +559,80 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+
+@register_optimizer("nanochat")
+def build_nanochat_optimizer(
+    model,
+    ddp: bool,
+    *,
+    unembedding_lr: float,
+    embedding_lr: float,
+    matrix_lr: float,
+    weight_decay: float,
+    scalar_lr: float,
+    optimizer_lr: float = -1.0,
+    optimizer_momentum: float = 0.9,
+) -> torch.optim.Optimizer:
+    del optimizer_lr, optimizer_momentum
+    param_groups = model.get_nanochat_param_groups(
+        unembedding_lr=unembedding_lr,
+        embedding_lr=embedding_lr,
+        matrix_lr=matrix_lr,
+        weight_decay=weight_decay,
+        scalar_lr=scalar_lr,
+    )
+    factory = DistMuonAdamW if ddp else MuonAdamW
+    return factory(param_groups)
+
+
+@register_optimizer("sgd")
+def build_torch_sgd_optimizer(
+    model,
+    ddp: bool,
+    *,
+    unembedding_lr: float,
+    embedding_lr: float,
+    matrix_lr: float,
+    weight_decay: float,
+    scalar_lr: float,
+    optimizer_lr: float = -1.0,
+    optimizer_momentum: float = 0.9,
+) -> torch.optim.Optimizer:
+    del ddp, unembedding_lr, embedding_lr, matrix_lr, scalar_lr
+    lr = optimizer_lr if optimizer_lr > 0 else 1e-2
+    param_groups = [dict(
+        params=[p for p in model.parameters() if p.requires_grad],
+        lr=lr,
+        momentum=optimizer_momentum,
+        weight_decay=weight_decay,
+        nesterov=False,
+        kind="sgd",
+    )]
+    return torch.optim.SGD(param_groups, lr=lr, momentum=optimizer_momentum, weight_decay=weight_decay, nesterov=False)
+
+
+@register_optimizer("adamw")
+def build_torch_adamw_optimizer(
+    model,
+    ddp: bool,
+    *,
+    unembedding_lr: float,
+    embedding_lr: float,
+    matrix_lr: float,
+    weight_decay: float,
+    scalar_lr: float,
+    optimizer_lr: float = -1.0,
+    optimizer_momentum: float = 0.9,
+) -> torch.optim.Optimizer:
+    del ddp, unembedding_lr, embedding_lr, matrix_lr, scalar_lr, optimizer_momentum
+    lr = optimizer_lr if optimizer_lr > 0 else 1e-3
+    param_groups = [dict(
+        params=[p for p in model.parameters() if p.requires_grad],
+        lr=lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=weight_decay,
+        kind="adamw",
+    )]
+    return torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay)

@@ -48,6 +48,9 @@ parser.add_argument("--max-new-tokens", type=int, default=256, help="max tokens 
 parser.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
 parser.add_argument("--top-k", type=int, default=50, help="top-k sampling (0 = disabled)")
 # Optimization
+parser.add_argument("--optimizer", type=str, default="nanochat", choices=["nanochat", "sgd", "adamw"], help="optimizer backend")
+parser.add_argument("--optimizer-lr", type=float, default=-1.0, help="global LR for standard torch optimizers such as SGD/AdamW (-1 = backend default)")
+parser.add_argument("--optimizer-momentum", type=float, default=0.9, help="momentum for SGD-like optimizers")
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
@@ -195,10 +198,13 @@ def run_gsm8k_eval(task, tokenizer, engine,
 
 # Init the optimizer
 optimizer = model.setup_optimizer(
+    optimizer_name=args.optimizer,
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
+    optimizer_lr=args.optimizer_lr,
+    optimizer_momentum=args.optimizer_momentum,
 )
 
 # Set the initial learning rate as a fraction of the base learning rate
