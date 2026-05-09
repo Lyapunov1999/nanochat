@@ -303,7 +303,6 @@ class Report:
             for file_name in EXPECTED_FILES:
                 section_file = os.path.join(report_dir, file_name)
                 if not os.path.exists(section_file):
-                    print(f"Warning: {section_file} does not exist, skipping")
                     continue
                 with open(section_file, "r", encoding="utf-8") as in_file:
                     section = in_file.read()
@@ -326,34 +325,38 @@ class Report:
             # Copy over the bloat metrics from the header
             out_file.write(bloat_data)
             out_file.write("\n\n")
-            # Collect all unique metric names
-            all_metrics = set()
-            for stage_metrics in final_metrics.values():
-                all_metrics.update(stage_metrics.keys())
-            # Custom ordering: CORE first, ChatCORE last, rest in middle
-            all_metrics = sorted(all_metrics, key=lambda x: (x != "CORE", x == "ChatCORE", x))
-            # Fixed column widths
-            stages = ["base", "sft", "rl"]
-            metric_width = 15
-            value_width = 8
-            # Write table header
-            header = f"| {'Metric'.ljust(metric_width)} |"
-            for stage in stages:
-                header += f" {stage.upper().ljust(value_width)} |"
-            out_file.write(header + "\n")
-            # Write separator
-            separator = f"|{'-' * (metric_width + 2)}|"
-            for stage in stages:
-                separator += f"{'-' * (value_width + 2)}|"
-            out_file.write(separator + "\n")
-            # Write table rows
-            for metric in all_metrics:
-                row = f"| {metric.ljust(metric_width)} |"
+            if final_metrics:
+                # Collect all unique metric names
+                all_metrics = set()
+                for stage_metrics in final_metrics.values():
+                    all_metrics.update(stage_metrics.keys())
+                # Custom ordering: CORE first, ChatCORE last, rest in middle
+                all_metrics = sorted(all_metrics, key=lambda x: (x != "CORE", x == "ChatCORE", x))
+                # Fixed column widths
+                stage_order = ["base", "sft", "rl"]
+                stages = [stage for stage in stage_order if stage in final_metrics]
+                metric_width = 15
+                value_width = 8
+                # Write table header
+                header = f"| {'Metric'.ljust(metric_width)} |"
                 for stage in stages:
-                    value = final_metrics.get(stage, {}).get(metric, "-")
-                    row += f" {str(value).ljust(value_width)} |"
-                out_file.write(row + "\n")
-            out_file.write("\n")
+                    header += f" {stage.upper().ljust(value_width)} |"
+                out_file.write(header + "\n")
+                # Write separator
+                separator = f"|{'-' * (metric_width + 2)}|"
+                for stage in stages:
+                    separator += f"{'-' * (value_width + 2)}|"
+                out_file.write(separator + "\n")
+                # Write table rows
+                for metric in all_metrics:
+                    row = f"| {metric.ljust(metric_width)} |"
+                    for stage in stages:
+                        value = final_metrics.get(stage, {}).get(metric, "-")
+                        row += f" {str(value).ljust(value_width)} |"
+                    out_file.write(row + "\n")
+                out_file.write("\n")
+            else:
+                out_file.write("No evaluation metrics were logged.\n\n")
             # Calculate and write total wall clock time
             if start_time and end_time:
                 duration = end_time - start_time
@@ -397,13 +400,20 @@ class DummyReport:
     def reset(self, *args, **kwargs):
         pass
 
+def get_report_dir():
+    report_dir = os.environ.get("NANOCHAT_REPORT_DIR")
+    if report_dir:
+        os.makedirs(report_dir, exist_ok=True)
+        return report_dir
+    from nanochat.common import get_base_dir
+    return os.path.join(get_base_dir(), "report")
+
 def get_report():
     # just for convenience, only rank 0 logs to report
-    from nanochat.common import get_base_dir, get_dist_info
+    from nanochat.common import get_dist_info
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if ddp_rank == 0:
-        report_dir = os.path.join(get_base_dir(), "report")
-        return Report(report_dir)
+        return Report(get_report_dir())
     else:
         return DummyReport()
 
