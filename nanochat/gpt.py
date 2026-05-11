@@ -27,7 +27,7 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW, OptimizerWithLineSearch
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
-from utils.utils import getOptNameRoot
+from nanochat.utils import getOptNameRoot
 
 
 def getParamsDict_optWrapper(partial_linesearch_type, model, model_type=None):
@@ -45,9 +45,9 @@ def getParamsDict_optWrapper(partial_linesearch_type, model, model_type=None):
     lm_head_params = list(model.lm_head.parameters())
     scalar_params = [model.resid_lambdas, model.x0_lambdas, model.smear_gate.weight, model.smear_lambda, model.backout_lambda]
 
-    front_params = embedding_params + value_embeds_params + front_block_params
-    back_params = back_block_params + lm_head_params + scalar_params
-    tail_params = lm_head_params + scalar_params
+    front_params = embedding_params + value_embeds_params + front_block_params + scalar_params
+    back_params = back_block_params + lm_head_params
+    tail_params = lm_head_params
 
     if partial_linesearch_type == 0:
         linesearch_params = front_params + back_params

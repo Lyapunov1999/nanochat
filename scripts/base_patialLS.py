@@ -244,8 +244,8 @@ def disable_fp8(model):
 
 # ! danger we may need to remove the compiling
 
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+# model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -307,17 +307,26 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 
-# ! opt???
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-)
+# # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# optimizer = model.setup_optimizer(
+#     # AdamW hyperparameters
+#     unembedding_lr=args.unembedding_lr * batch_lr_scale,
+#     embedding_lr=args.embedding_lr * batch_lr_scale,
+#     scalar_lr=args.scalar_lr * batch_lr_scale,
+#     # Muon hyperparameters
+#     matrix_lr=args.matrix_lr * batch_lr_scale,
+#     weight_decay=weight_decay_scaled,
+# )
+
+
+# ! check this
+optName="SGD+M-Wolfe-2"
+config_filename = f"config/runGPT.json"
+with open(config_filename, 'r') as f:
+    configs = json.load(f)
+    exp_conf = configs["experiment_params"]
+    opt_conf = configs["optimizer_params"]
+optimizer=model.setup_optimizerwithlinesearch(model, optName, opt_conf)
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -361,6 +370,8 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
+
+# ! we don't need this
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps

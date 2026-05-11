@@ -8,9 +8,11 @@ Further contributions from @karpathy and @chrisjmccormick.
 """
 
 import torch
+import torch.optim as optim
 import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
+from nanochat.linesearch import strong_wolfe, armijo, linesearch
 
 # -----------------------------------------------------------------------------
 """
@@ -533,3 +535,493 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+
+class OptimizerWithLineSearch():
+    def __init__(self, 
+     ls_opt,
+     fixed_opt,
+     c1: float = 1e-4, # Armijo parameter
+     c2: float = 0.9, # curvature parameter
+     defaultLR_max_mult: float = 1e5, # bounds multiple of defaultLR the line-search LR can be
+     defaultLR_min_mult: float = 1e-1,
+     max_iter: int = 1, # number of iterations per step; note PyTorch's l-BFGS defaults to 20
+     per_parameter: bool = False, # process parameters separately (True) or as a group (False)
+     pos_only: bool = False, # defaults to using both positive and negative LRs
+     monotone_strength: float= 1.0, # Zhang and Hager's \eta_k: 0=monotone, 1=A_k (average)
+     ls_type: str ="strong_wolfe",
+     extraLs_opt: optim=None # extra optimizer for stem + head style partial LS
+    ):
+        #if not isinstance(ls_opt, (optim.SGD, optim.AdamW)):
+        #    raise TypeError("Only SGD and AdamW are supported for now.")   
+        self.ls_opt = ls_opt
+        self.fixed_opt = fixed_opt
+        self.extraLs_opt = extraLs_opt
+        self.per_parameter = per_parameter
+        self.c1 = c1
+        self.c2 = c2
+        if defaultLR_max_mult is None:
+            defaultLR_max_mult = 1e5
+        if defaultLR_min_mult is None:
+            defaultLR_min_mult = 1e-1
+        self.defaultLR_max_mult = defaultLR_max_mult
+        self.defaultLR_min_mult = defaultLR_min_mult
+        self.max_iter = max_iter
+        self.pos_only = pos_only
+        self.monotone_strength = monotone_strength
+        self.ls_type = ls_type
+        self.Ck = float("inf")
+        self.Qk = 0
+
+    @torch.no_grad()
+    def get_direction(self, params, group, closure=None):
+        #print(f"get_direction before: group lr={self.ls_opt.param_groups[0]['prev_lr']}")
+        #params_before = [p.clone() for p in params]
+        params_before = copy.deepcopy(params)
+        #state_before = copy.deepcopy(self.ls_opt.state_dict())
+        # ls_opt.step() uses the lr (defaultLR) passed in when it was created and so
+        #   we need to undo this to get the `pure' direction. The step size found from
+        #   the line search is not applied via calling step but by updating the 
+        #   parameter directly
+        # group['lr'] contains the default LR and is also the initial value to the LS
+        # group['prev_lr'] contains the calculated LR from the LS
+        # optWrapper is not a torch.optim.Optimizer so its step() function doesn't
+        #   trigger any updates on buffers (e.g. m and v for AdamW). ls_opt.step()
+        #   is needed to update these buffers. ls_opt.step() is only called here and
+        #   the optimizer buffers are updated with the gradients from the last
+        #   iteration before any work with the line search. get_directions is called 
+        #   once per parameter group. If there is just one parameter group, then the
+        #   optimizer buffers (e.g. m and v for AdamW) only gets updated once per call
+        #   to step. Only ls_opt.step() is updated because the line search and is only 
+        #   over the subset of parameters handled by ls_opt and the other parameters 
+        #   (e.g. from fixed_opt) should produce zero direction
+        if isinstance(self.ls_opt, torch.optim.LBFGS) or isinstance(self.ls_opt, nag):
+            def inner_closure():
+                #self.ls_opt.zero_grad()
+                loss = closure()
+                return loss
+            self.ls_opt.step(inner_closure)
+        else:
+            self.ls_opt.step()
+        directions = [((p - p_before)/group['lr']).view(-1) for p_before,p in zip(params_before, params)]
+        for p_before, p in zip(params_before, params):
+            p.data.copy_(p_before)
+        #self.ls_opt.load_state_dict(state_before)
+        #del state_before
+        #print(f"get direction after: lr = {self.ls_opt.param_groups[0]['prev_lr']}")
+        #print(directions)
+        return torch.cat(directions, 0) # vectorize
+
+    def __set_state_defaults(self, state):
+        state.setdefault('n_iter', 0)
+        state.setdefault('done', False)
+        state.setdefault('prev_grad', None)
+        state.setdefault('prev_d', None)
+        state.setdefault('prev_f', float('inf'))
+        state.setdefault('n_pos_lr', 0)
+        state.setdefault('n_neg_lr', 0)
+        state.setdefault('prev_gTd', 0)
+        state.setdefault('numel_cache', None)
+        state.setdefault('prev_lr', 0)
+    
+    def __update_state(self, state, loss, lr, d, grad, gTd):
+        state['prev_f'] = float(loss)
+        state['prev_lr'] = lr
+        #print(f"__update_state: lr={lr}")
+        state['prev_gTd'] = gTd
+        if lr < 0:
+            state['n_neg_lr'] += 1
+        else:
+            state['n_pos_lr'] += 1
+        if state['prev_d'] is None:
+            state['prev_d'] = d.clone(memory_format=torch.contiguous_format)
+        else:
+            state['prev_d'].copy_(d)
+        if state['prev_grad'] is None:
+            state['prev_grad'] = grad.clone(memory_format=torch.contiguous_format)
+        else:
+            state['prev_grad'].copy_(grad)
+        state['n_iter'] += 1
+
+    def __set_group_defaults(self, group):
+        #print("__set_group_defaults")
+        group['n_iter'] = 0
+        group['done'] = False
+        group['prev_grad'] = None
+        group['prev_d'] = None
+        group['prev_f'] = float('inf')
+        group['n_pos_lr'] = 0
+        group['n_neg_lr'] = 0
+        group['prev_gTd'] = 0
+        group['numel_cache'] = None
+        group['prev_lr'] = 0
+    
+    def __update_group(self, group, loss, lr, d, grad, gTd):
+        group['prev_f'] = float(loss)
+        group['prev_lr'] = lr
+        #print(f"update_group: lr = {lr}, prev_lr = {group['prev_lr']}")
+        group['prev_gTd'] = gTd
+        if lr < 0:
+            group['n_neg_lr'] += 1
+        else:
+            group['n_pos_lr'] += 1
+        if group['prev_d'] is None:
+            group['prev_d'] = d.clone(memory_format=torch.contiguous_format)
+        else:
+            group['prev_d'].copy_(d)
+        if group['prev_grad'] is None:
+            group['prev_grad'] = grad.clone(memory_format=torch.contiguous_format)
+        else:
+            group['prev_grad'].copy_(grad)
+        group['n_iter'] += 1    
+
+    # taken from PyTorch's l-BFGS implementation
+    def _numel(self, params, numel_cache):
+        if numel_cache is None:
+            numel_cache = sum(
+                2 * p.numel() if torch.is_complex(p) else p.numel()
+                for p in params
+            )
+        return numel_cache
+
+    # taken from PyTorch's l-BFGS implementation
+    def _gather_flat_grad(self, params):
+        views = []
+        for p_idx, p in enumerate(params):
+            if p.grad is None:
+                view = p.new(p.numel()).zero_()
+            elif p.grad.is_sparse:
+                view = p.grad.to_dense().view(-1)
+            else:
+                view = p.grad.view(-1)
+            if torch.is_complex(view):
+                view = torch.view_as_real(view).view(-1)
+            views.append(view)
+        return torch.cat(views, 0)
+
+    # taken from PyTorch's l-BFGS implementation
+    def _add_grad(self, params, numel_cache, step_size, update):
+        offset = 0
+        for p in params:
+            if torch.is_complex(p):
+                p = torch.view_as_real(p)
+            numel = p.numel()
+            # view as to avoid deprecated pointwise semantics
+            p.add_(update[offset : offset + numel].view_as(p), alpha=step_size)
+            offset += numel
+        assert offset == self._numel(params, numel_cache)
+
+    # taken from PyTorch's l-BFGS implementation
+    def _clone_param(self, params):
+        return [p.clone(memory_format=torch.contiguous_format) for p in params]
+    
+    # taken from PyTorch's l-BFGS implementation
+    def _set_param(self, params, params_data):
+        for p, pdata in zip(params, params_data):
+            p.copy_(pdata)
+    
+    # print debug information for per-layer parameters
+    def __print_debug_for_total(self, pList):
+        n_pos_lr, n_neg_lr = 0, 0
+        min_gTd, max_gTd = float('inf'), -float('inf')
+        min_lr, max_lr = float('inf'), -float('inf')
+        for p in pList:
+            state = self.ls_opt.state[p]
+            n_pos_lr += state['n_pos_lr']
+            n_neg_lr += state['n_neg_lr']
+            gTd, lr = state['prev_gTd'], state['prev_lr']
+            if gTd < min_gTd:
+                min_gTd = gTd
+            if gTd > max_gTd:
+                max_gTd = gTd
+            if lr < min_lr:
+                min_lr = lr
+            if lr > max_lr:
+                max_lr = lr
+        print(f" n pos lr={n_pos_lr}, n neg lr={n_neg_lr}, gTd=[{min_gTd:>0.4f},"
+        f" {max_gTd:>0.4f}], lr=[{min_lr:>0.4f}, {max_lr:>0.4f}]")
+
+    # this version is for per-layer parameters
+    #  returns the step size and directional derivative given search direction d
+    #  and parameter p using either l-BFGS's strong wolfe line search (default)
+    #  or a simpler implementation of strong wolfe (without cubic interpolation to
+    #  find next trial step size)
+    def __stepsize(self, p, numel_cache, closure, d, grad, loss, 
+     c1, c2, defaultLR):#, lsType="strong_wolfe"):
+        gTd = torch.dot(d,grad)
+
+        def objGradFunc(p_fixed, t, d):
+            self._add_grad([p], numel_cache, t, d)
+            f_new = closure()
+            g_new = self._gather_flat_grad([p])
+            self._set_param([p], [p_fixed]) 
+            return float(f_new), g_new
+        
+        def objFunc(p_fixed, t, d):
+            self._add_grad([p], numel_cache, t, d)
+            f_new = closure()
+            self._set_param([p], [p_fixed])
+            return float(f_new)
+        
+        if self.ls_type == "strong_wolfe":
+            f = loss.item()
+            if self.Ck==float('inf'):
+                self.Ck = f
+            if gTd > 0 and not self.pos_only:
+                f_new, g_new, lr, ls_func_evals = strong_wolfe(objGradFunc, 
+                    p.clone(memory_format=torch.contiguous_format), 
+                    defaultLR, d.neg(), f, -gTd, c1=c1, c2=c2, non_monotone_f=self.Ck,
+                    min_t=self.defaultLR_min_mult*defaultLR, max_t=self.defaultLR_max_mult*defaultLR)
+                if math.isnan(lr):
+                    lr = 0
+                    f_new = f
+                lr *= -1
+                #print(f" gTd={gTd:>0.4f}, lr={lr:>0.4f}, f={f:0.4f}, f_new={f_new:>0.4f}, ls_func_evals={ls_func_evals}")
+            else:
+                f_new, g_new, lr, ls_func_evals = strong_wolfe(objGradFunc, 
+                    p.clone(memory_format=torch.contiguous_format), 
+                    defaultLR, d, f, grad, gTd, c1=c1, c2=c2, non_monotone_f=self.Ck,
+                    min_t=self.defaultLR_min_mult*defaultLR, max_t=self.defaultLR_max_mult*defaultLR) 
+                if math.isnan(lr):
+                    lr =0
+                    f_new = f
+                #print(f" gTd={gTd:>0.4f}, lr={lr:>0.4f}, f={f:0.4f}, f_new={f_new:>0.4f}, ls_func_evals={ls_func_evals}")
+            
+            self.Ck = self.monotone_strength* self.Qk* self.Ck + f_new
+            self.Qk = self.monotone_strength* self.Qk + 1
+            self.Ck/= self.Qk
+        elif self.ls_type == "simple_strong_wolfe":
+            if gTd > 0 and not self.pos_only:
+                lr = -1.0* linesearch(objGradFunc, d.neg(), grad, loss, -gTd, 
+                    p.clone(memory_format=torch.contiguous_format), c1=c1, c2=c2)
+            else:
+                lr = linesearch(objGradFunc, d, grad, loss, gTd,
+                    p.clone(memory_format=torch.contiguous_format), c1=c1, c2=c2)
+        elif self.ls_type == "armijo":
+            f = loss.item()
+            if self.Ck==float('inf'):
+                self.Ck=f
+            if gTd > 0 and not self.pos_only:
+                lr, f_new = -1.0* armijo(objFunc, d.neg(), grad, max(self.Ck, f), defaultLR,
+                    p.clone(memory_format=torch.contiguous_format), -gTd, c1=c1)
+            else:
+                lr, f_new = armijo(objFunc, d, grad, max(self.Ck, f), defaultLR,
+                    p.clone(memory_format=torch.contiguous_format), gTd, c1=c1)
+            self.Ck = self.monotone_strength* self.Qk* self.Ck + f_new
+            self.Qk = self.monotone_strength* self.Qk + 1
+            self.Ck/= self.Qk
+        else:
+            lr = defaultLR
+            print(f"Unrecognized lsType {self.ls_type}. Using default LR={lr}.")
+
+        return lr, gTd
+    
+    # this version is for no per-layer parameters 
+    #  returns the step size and directional derivative given search direction d
+    #  and list of parameters pList using either l-BFGS's strong wolfe line search (default)
+    #  or a simpler implementation of strong wolfe (without cubic interpolation to
+    #  find next trial step size)
+    def __stepsize_no_per_layer(self, pList, numel_cache, closure, d, grad, loss, 
+     c1, c2, defaultLR):#, lsType="strong_wolfe"):
+        gTd = torch.dot(d, grad)
+
+        def objGradFunc(x, t, d):
+            self._add_grad(pList, numel_cache, t, d)
+            f_new = closure()
+            g_new = self._gather_flat_grad(pList)
+            self._set_param(pList, x)
+            return float(f_new), g_new
+    
+        def objFunc(x, t, d):
+            self._add_grad(pList, numel_cache, t, d)
+            f_new = closure()
+            self._set_param(pList, x)
+            return float(f_new)
+
+        pfixed_list = self._clone_param(pList)
+        if self.ls_type == "strong_wolfe":
+            f = loss.item()
+            if self.Ck==float('inf'):
+                #print("Ck is inf")
+                self.Ck = f
+            #print(f"__stepsize_no_per_layer: gTd = {gTd}, f_prev = {f}, Q={self.Qk}, C={self.Ck}")
+            if gTd > 0 and not self.pos_only:
+                f_new, g_new, lr, ls_func_evals = strong_wolfe(objGradFunc, pfixed_list, 
+                    defaultLR, d.neg(), f, grad, -gTd, c1=c1, c2=c2, non_monotone_f=self.Ck,
+                    min_t=self.defaultLR_min_mult*defaultLR, max_t=self.defaultLR_max_mult*defaultLR)
+                #lr_check = lr
+                f_new_check = f_new
+                if math.isnan(lr):
+                    lr = 0
+                    f_new = f
+                lr *= -1
+                #print(f" gTd={gTd:>0.4f}, lr={lr_check:>0.4f}-->{lr:>0.4f}, f={f:>0.4f}, f_new={f_new_check:>0.4}-->{f_new:>0.4f}, ls_func_evals={ls_func_evals}")
+            else:
+                f_new, g_new, lr, ls_func_evals = strong_wolfe(objGradFunc, pfixed_list, 
+                    defaultLR, d, f, grad, gTd, c1=c1, c2=c2, non_monotone_f=self.Ck,
+                    min_t=self.defaultLR_min_mult*defaultLR, max_t=self.defaultLR_max_mult*defaultLR)
+                #lr_check = lr
+                f_new_check = f_new
+                if math.isnan(lr):
+                    lr = 0
+                    f_new = f
+                #print(f" gTd={gTd:>0.4f}, lr={lr_check:>0.4f}-->{lr:>0.4f}, f={f:0.4f}, f_new={f_new_check:>0.4}-->{f_new:>0.4f}, ls_func_evals={ls_func_evals}")
+            
+            self.Ck = self.monotone_strength* self.Qk* self.Ck + f_new
+            self.Qk = self.monotone_strength* self.Qk + 1
+            self.Ck/= self.Qk
+
+            #print(f"new C = {self.Ck}, new Q = {self.Qk}")
+        elif self.ls_type == "simple_strong_wolfe":
+            if gTd > 0 and not self.pos_only:
+                lr = -1.0* linesearch(objGradFunc, d.neg(), grad, loss, -gTd, pfixed_list, 
+                    c1=c1, c2=c2, t0=defaultLR)
+            else:
+                lr = linesearch(objGradFunc, d, grad, loss, gTd, pfixed_list, c1=c1, c2=c2,
+                    t0=defaultLR)
+        elif self.ls_type == "armijo":
+            f = loss.item()
+            if self.Ck==float('inf'):
+                self.Ck=f
+            if gTd > 0 and not self.pos_only:
+                lr, f_new = armijo(objFunc, d.neg(), grad, max(self.Ck, f), defaultLR,
+                    pfixed_list, -gTd, c1=c1)
+                lr *= -1.0
+            else:
+                lr, f_new = armijo(objFunc, d, grad, max(self.Ck, f), defaultLR,
+                    pfixed_list, gTd, c1=c1)
+            #print(f"armijo: lr={lr}")
+            self.Ck = self.monotone_strength* self.Qk* self.Ck + f_new
+            self.Qk = self.monotone_strength* self.Qk + 1
+            self.Ck/= self.Qk
+        else:
+            lr = defaultLR
+            print(f"__stepsize_no_per_layer: Unrecognized lsType {self.ls_type}. Using default LR={lr}.")
+            
+        return lr, gTd
+
+    @torch.no_grad()
+    def step(self, closure, delay_start_step=0, ls_extra=False, normalize_directions=False):
+        closure = torch.enable_grad()(closure)
+        loss = closure()
+
+        #print(f"optWrapper.step: {self.ls_type}, {self.ls_opt.param_groups[0]["line_search_fn"]}, {self.monotone_strength}, {self.c1}, {self.c2}")
+
+        all_done = True
+        if ls_extra:
+            param_groups_to_use = self.extraLs_opt.param_groups
+        else:
+            param_groups_to_use = self.ls_opt.param_groups
+        #for group_idx, group in enumerate(self.ls_opt.param_groups):
+        for group_idx, group in enumerate(param_groups_to_use):
+            pList = group['params']
+            #print(group.keys())
+            try:
+                num_step = self.ls_opt.state[pList[0]]['step']
+                if isinstance(self.ls_opt, optim.SGD):
+                    self.ls_opt.state[pList[0]]['step'] += 1
+                #print(f"1:{self.ls_opt.state[pList[0]].keys()}")
+            except KeyError:
+                num_step = 0
+                if isinstance(self.ls_opt, optim.SGD):
+                    self.ls_opt.state[pList[0]]['step'] = 0
+                #print(f"2:{self.ls_opt.state[pList[0]].keys()}")
+
+            if self.per_parameter:
+                n_iter = 0
+                while n_iter < self.max_iter:
+                    n_iter += 1
+                    for p_idx, p in enumerate(pList):
+                        state = self.ls_opt.state[p]
+                        self.__set_state_defaults(state)
+                        if not state['done']:
+                            grad = self._gather_flat_grad([p])
+                            #if grad.abs().max() <= 1e-7: # TODO: make optimality check configurable
+                            #    print("  ***optimality condition met")
+                            #    continue
+
+                            d = self.get_direction([p], group, closure=closure)
+                            if normalize_directions:
+                                norm = (d**2).sum()**0.5
+                                if norm > 1e-4:
+                                    d /= norm
+                            defaultLR = group['lr']
+
+                            if num_step >= delay_start_step:
+                                lr, gTd = self.__stepsize(p, state['numel_cache'], closure, d, grad, 
+                                    loss, self.c1, self.c2, defaultLR)
+                                #if lr > 0 and lr < defaultLR:
+                                #    lr = defaultLR
+                            else:
+                                lr = defaultLR
+                                gTd = torch.dot(d, grad)
+
+                            self.__update_state(state, loss, lr, d, grad, gTd)
+                            self._add_grad([p], state['numel_cache'], lr, d)
+
+                            #if d.mul(lr).abs().max() < 1e-9: # TODO: make progress check configurable
+                            #    print("  ***lack of progress")
+                            #    continue
+
+                        # check again if we're done here
+                        if not state['done']:
+                            all_done = False
+                    loss = closure()
+            else:
+                # store everything in group[blah]
+                self.__set_group_defaults(group)
+                if not group['done']:
+                    n_iter = 0
+                    #print(f"About to process group {group_idx}: {n_iter}, {self.max_iter}")
+                    while n_iter < self.max_iter:
+                        grad = self._gather_flat_grad(pList)
+
+                        #if grad.abs().max() <= 1e-7: # TODO: make optimality check configurable
+                        #    print(f"  ***optimality condition met: {grad.abs().max()}")
+                        #    #break
+
+                        n_iter += 1
+
+                        d = self.get_direction(pList, group, closure=closure)
+                        if normalize_directions:
+                            norm = (d**2).sum()**0.5
+                            if norm > 1e-4:
+                                d /= norm
+                        defaultLR = group['lr']
+
+                        if num_step >= delay_start_step:
+                            lr, gTd= self.__stepsize_no_per_layer(pList, group['numel_cache'],
+                                closure, d, grad, loss, self.c1, self.c2, defaultLR)
+                            #print(f"stepsize_no_per_layer returns lr={lr}")
+                            #if lr > 0 and lr < defaultLR:
+                            #    lr = defaultLR
+                        else:
+                            lr = defaultLR
+                            gTd = torch.dot(d, grad)
+                        
+                        self.__update_group(group, loss, lr, d, grad, gTd)
+                        #print(f"group['prev_lr'] is {group['prev_lr']} for group number {group_idx}")
+                        self._add_grad(pList, group['numel_cache'], lr, d)
+
+                        #if d.mul(lr).abs().max() < 1e-9: # TODO: make progress check configurable
+                        #    print("  ***lack of progress")
+                        #    #break
+                        #
+                        #    print(f" n_iter={n_iter}/ group[n_iter]={group['n_iter']}: n pos lr={group['n_pos_lr']},"
+                        #    f" n neg lr={group['n_neg_lr']}, gTd={gTd:>0.4f}, lr={lr:>0.4f},"
+                        #    f" f={float(loss):>0.4f}, norm(g)={torch.linalg.vector_norm(grad):>0.4f},"
+                        #    f" norm(d)={torch.linalg.vector_norm(d):>0.4f}")
+                        loss = closure()
+                        #print(f"idx={group_idx}, id(group)={id(group)}, step: after closure(): lr={lr}, group lr={group['prev_lr']}")
+                
+                # check again if we're done here
+                if not group['done']:
+                    all_done = False
+
+        #print("before returning from step")
+        #for group_idx, group in enumerate(self.ls_opt.param_groups):
+        #    print(f"group_idx={group_idx}, id(group)={id(group)}: lr={group['prev_lr']}, gtd={group['prev_gTd']}, f={group['prev_f']}")
+        return loss, all_done
+
+    def step_extra(self, closure, delay_start_step=0):
+        return self.step(closure, delay_start_step=delay_start_step, ls_extra=True)
