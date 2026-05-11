@@ -14,6 +14,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+import json
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,8 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
+
+from utils.utils import getOptNameRoot
 
 @dataclass
 class GPTConfig:
@@ -412,6 +415,79 @@ class GPT(nn.Module):
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
+    
+    # ! copied from partialLS
+    # model is gpt, optName is "SGD+M-Wolfe-2"
+    # with open(config_filename, 'r') as f:
+    #     configs = json.load(f)
+    #     exp_conf = configs["experiment_params"]
+    #     pt_conf = configs["optimizer_params"]
+    def setup_optimizerwithlinesearch(model, optName, opt_conf):
+        #print(f"setOptimizer: optName={optName}, model is {type(model)}")
+        if "-Wolfe" in optName or "-Armijo" in optName or "-Lip" in optName:
+            if "-Wolfe" in optName: 
+                ls_type = "strong_wolfe"
+                optNameRoot, per_parameter, pos_only, partial_linesearch_type = getOptNameRoot(
+                    optName, "-Wolfe")
+                
+
+            if partial_linesearch_type != opt_conf[optName]["partial_linesearch_type"]:
+                print(f"ERROR: {optName} has partial line search type {partial_linesearch_type} set in json.")
+
+            linesearch_params, fixedLR_params = getParamsDict_optWrapper(
+                opt_conf[optName]["partial_linesearch_type"], 
+                model, model.model_type)
+
+            if optNameRoot == "SGD+M":
+                ls_opt = optim.SGD(linesearch_params,lr=opt_conf[optName]["lr"],
+                    weight_decay=opt_conf[optName]["weight_decay"],
+                    momentum=opt_conf[optName]["momentum"])
+                fixed_opt = optim.SGD(fixedLR_params, lr=opt_conf[optName]["lr"],
+                    weight_decay=opt_conf[optName]["weight_decay"],
+                    momentum=opt_conf[optName]["momentum"])
+            
+            else:
+                print(f"setOptimizer: unhandled optimizer {optName}.")
+                return None
+
+            # TODO: clean this up - this is super hacky
+            extraLs_opt = None
+            if opt_conf[optName]["partial_linesearch_type"]==1 and model.model_type=="resnet":
+                extraLs_params = list(model.network.conv1.parameters()) + \
+                    list(model.network.bn1.parameters())
+                if optNameRoot == "SGD+M":
+                    extraLs_opt = optim.SGD(extraLs_params, lr=opt_conf[optName]["lr"],
+                    weight_decay=opt_conf[optName]["weight_decay"],
+                    momentum=opt_conf[optName]["momentum"])
+                else:
+                    print(f"setOptimizer: unhandled optimizer {optName}.")
+                    return None
+            
+            try:
+                defaultLR_max_mult = opt_conf[optName]["defaultLR_max_mult"]
+            except KeyError:
+                defaultLR_max_mult = None
+            try:
+                defaultLR_min_mult = opt_conf[optName]["defaultLR_min_mult"]
+            except KeyError:
+                defaultLR_min_mult = None
+            return OptimizerWithLineSearch(ls_opt, fixed_opt, per_parameter=per_parameter, 
+                pos_only=pos_only, c1=opt_conf[optName]["c1"], c2=opt_conf[optName]["c2"], 
+                defaultLR_max_mult=defaultLR_max_mult, 
+                defaultLR_min_mult=defaultLR_min_mult, 
+                monotone_strength=opt_conf[optName]["monotone_strength"],
+                ls_type=ls_type, extraLs_opt = extraLs_opt)
+        else:
+            if optNameRoot == "SGD+M": # SGD+M, SGD+M-cosine
+                return optim.SGD(model.parameters(),  lr=opt_conf[optName]["lr"], 
+                    weight_decay=opt_conf[optName]["weight_decay"],
+                    momentum=opt_conf[optName]["momentum"])
+            else:
+                print(f"setOptimizer: unhandled optimizer {optName}.")
+                return None
+        
+        print(f"setOptimizer: unhandled optimizer {optName}.")
+        return None
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
