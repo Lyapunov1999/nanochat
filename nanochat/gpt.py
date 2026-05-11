@@ -19,14 +19,58 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.optim import MuonAdamW, DistMuonAdamW, OptimizerWithLineSearch
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
 from utils.utils import getOptNameRoot
+
+
+def getParamsDict_optWrapper(partial_linesearch_type, model, model_type=None):
+    if model_type not in (None, "gpt"):
+        raise ValueError(f"Unsupported model_type for GPT line search wrapper: {model_type}")
+
+    # ! check the split
+    n_layer = len(model.transformer.h)
+    mid = n_layer // 2
+
+    embedding_params = list(model.transformer.wte.parameters())
+    value_embeds_params = list(model.value_embeds.parameters())
+    front_block_params = list(model.transformer.h[:mid].parameters())
+    back_block_params = list(model.transformer.h[mid:].parameters())
+    lm_head_params = list(model.lm_head.parameters())
+    scalar_params = [model.resid_lambdas, model.x0_lambdas, model.smear_gate.weight, model.smear_lambda, model.backout_lambda]
+
+    front_params = embedding_params + value_embeds_params + front_block_params
+    back_params = back_block_params + lm_head_params + scalar_params
+    tail_params = lm_head_params + scalar_params
+
+    if partial_linesearch_type == 0:
+        linesearch_params = front_params + back_params
+        fixedLR_params = []
+    elif partial_linesearch_type == 1:
+        linesearch_params = back_params
+        fixedLR_params = front_params
+    elif partial_linesearch_type == 2:
+        linesearch_params = tail_params
+        fixedLR_params = front_params + back_block_params
+    else:
+        raise ValueError(f"Unsupported partial_linesearch_type for GPT: {partial_linesearch_type}")
+
+    all_params = list(model.parameters())
+    expected_ids = {id(p) for p in all_params}
+    linesearch_ids = {id(p) for p in linesearch_params}
+    fixed_ids = {id(p) for p in fixedLR_params}
+    assert len(linesearch_ids) == len(linesearch_params), "Duplicate parameters in linesearch_params"
+    assert len(fixed_ids) == len(fixedLR_params), "Duplicate parameters in fixedLR_params"
+    assert linesearch_ids.isdisjoint(fixed_ids), "Parameters overlap between linesearch and fixed groups"
+    assert linesearch_ids | fixed_ids == expected_ids, "Parameter partition does not cover the full GPT model"
+
+    return [{'params': linesearch_params, 'group_name': 'linesearch_params'}], [{'params': fixedLR_params, 'group_name': 'fixed_params'}]
 
 @dataclass
 class GPTConfig:
@@ -424,6 +468,7 @@ class GPT(nn.Module):
     #     pt_conf = configs["optimizer_params"]
     def setup_optimizerwithlinesearch(model, optName, opt_conf):
         #print(f"setOptimizer: optName={optName}, model is {type(model)}")
+        optNameRoot = optName
         if "-Wolfe" in optName or "-Armijo" in optName or "-Lip" in optName:
             if "-Wolfe" in optName: 
                 ls_type = "strong_wolfe"
@@ -436,7 +481,7 @@ class GPT(nn.Module):
 
             linesearch_params, fixedLR_params = getParamsDict_optWrapper(
                 opt_conf[optName]["partial_linesearch_type"], 
-                model, model.model_type)
+                model, "gpt")
 
             if optNameRoot == "SGD+M":
                 ls_opt = optim.SGD(linesearch_params,lr=opt_conf[optName]["lr"],
@@ -449,19 +494,6 @@ class GPT(nn.Module):
             else:
                 print(f"setOptimizer: unhandled optimizer {optName}.")
                 return None
-
-            # TODO: clean this up - this is super hacky
-            extraLs_opt = None
-            if opt_conf[optName]["partial_linesearch_type"]==1 and model.model_type=="resnet":
-                extraLs_params = list(model.network.conv1.parameters()) + \
-                    list(model.network.bn1.parameters())
-                if optNameRoot == "SGD+M":
-                    extraLs_opt = optim.SGD(extraLs_params, lr=opt_conf[optName]["lr"],
-                    weight_decay=opt_conf[optName]["weight_decay"],
-                    momentum=opt_conf[optName]["momentum"])
-                else:
-                    print(f"setOptimizer: unhandled optimizer {optName}.")
-                    return None
             
             try:
                 defaultLR_max_mult = opt_conf[optName]["defaultLR_max_mult"]
@@ -476,7 +508,7 @@ class GPT(nn.Module):
                 defaultLR_max_mult=defaultLR_max_mult, 
                 defaultLR_min_mult=defaultLR_min_mult, 
                 monotone_strength=opt_conf[optName]["monotone_strength"],
-                ls_type=ls_type, extraLs_opt = extraLs_opt)
+                ls_type=ls_type)
         else:
             if optNameRoot == "SGD+M": # SGD+M, SGD+M-cosine
                 return optim.SGD(model.parameters(),  lr=opt_conf[optName]["lr"], 
