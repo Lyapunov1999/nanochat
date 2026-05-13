@@ -244,8 +244,8 @@ def disable_fp8(model):
 
 # ! danger we may need to remove the compiling
 
-# orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-# model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -327,6 +327,8 @@ with open(config_filename, 'r') as f:
     exp_conf = configs["experiment_params"]
     opt_conf = configs["optimizer_params"]
 optimizer=model.setup_optimizerwithlinesearch(model, optName, opt_conf)
+is_linesearch_optimizer = hasattr(optimizer, "ls_opt") and hasattr(optimizer, "fixed_opt")
+partial_linesearch_type = opt_conf.get(optName, {}).get("partial_linesearch_type")
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -427,6 +429,10 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+if is_linesearch_optimizer and grad_accum_steps != 1:
+    raise ValueError("Partial line search training currently requires grad_accum_steps == 1")
+if is_linesearch_optimizer and scaler is not None:
+    raise ValueError("Partial line search training does not support GradScaler/fp16 yet")
 
 # Go!
 while True:
@@ -524,36 +530,92 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        if scaler is not None:
-            scaler.scale(loss).backward()
+    if is_linesearch_optimizer:
+        ls_opt_params = [p for group in optimizer.ls_opt.param_groups for p in group["params"]]
+        cached_forward = None
+        if "-Wolfe" in optName or "-Armijo" in optName:
+            if exp_conf["use_augment"]:
+                optimizer.ls_opt.zero_grad()
+                optimizer.fixed_opt.zero_grad()
+                augment_loss = orig_model(x, y)
+                augment_loss.backward()
+                optimizer.fixed_opt.step()
+                optimizer.ls_opt.step()
+
+            if partial_linesearch_type in (1, 2):
+                with torch.no_grad():
+                    cached_forward = orig_model.build_linesearch_cache(x, partial_linesearch_type)
+
+            def closure():
+                optimizer.ls_opt.zero_grad()
+                if cached_forward is None:
+                    loss_closure = orig_model(x, y)
+                else:
+                    loss_closure = orig_model.forward_from_linesearch_cache(cached_forward, targets=y)
+                loss_closure.backward()
+                return loss_closure
+
+            loss, all_done = optimizer.step(
+                closure=closure,
+                delay_start_step=opt_conf[optName]["delay_start_step"],
+            )
+            train_loss = loss.detach()
+
+            # ! check the bcd part
+
+            if exp_conf["use_bcd"]:
+                for param in ls_opt_params:
+                    param.requires_grad = False
+
+            optimizer.fixed_opt.zero_grad()
+            fixed_loss = orig_model(x, y)
+            fixed_loss.backward()
+            optimizer.fixed_opt.step()
+
+            if exp_conf["use_bcd"]:
+                for param in ls_opt_params:
+                    param.requires_grad = True
         else:
-            loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # step the optimizer
-    lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    if scaler is not None:
-        scaler.unscale_(optimizer)
-        # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
-        if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
+            raise ValueError(f"Unsupported line search optimizer path for optName={optName}")
+        x, y, dataloader_state_dict = next(train_loader)
     else:
-        optimizer.step()
+        all_done = False
+        # ! we don't do accumulation
+        for micro_step in range(grad_accum_steps):
+            loss = model(x, y)
+            train_loss = loss.detach() # for logging
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # step the optimizer
+        # ! should we do this?
+        lrm = get_lr_multiplier(step)
+        muon_momentum = get_muon_momentum(step)
+        muon_weight_decay = get_weight_decay(step)
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if group['kind'] == 'muon':
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = muon_weight_decay
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            # In distributed training, all ranks must agree on whether to skip the step.
+            # Each rank may independently encounter inf/nan gradients, so we all-reduce
+            # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+            if is_ddp_initialized():
+                for v in scaler._found_inf_per_device(optimizer).values():
+                    dist.all_reduce(v, op=dist.ReduceOp.MAX)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+    if not is_linesearch_optimizer:
+        lrm_for_log = lrm
+    else:
+        lrm_for_log = optimizer.ls_opt.param_groups[0]["lr"]
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -581,19 +643,21 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm_for_log:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
+            "train/lrm": lrm_for_log,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if is_linesearch_optimizer:
+            log_data["train/all_done"] = float(all_done)
         wandb_run.log(log_data)
 
     # state update

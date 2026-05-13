@@ -521,17 +521,19 @@ class GPT(nn.Module):
         print(f"setOptimizer: unhandled optimizer {optName}.")
         return None
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        B, T = idx.size()
-
+    def _get_cos_sin(self, idx, kv_cache=None):
+        _, T = idx.size()
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        return self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
+    def _embed_and_smear(self, idx, kv_cache=None):
+        B, T = idx.size()
+        cos_sin = self._get_cos_sin(idx, kv_cache=kv_cache)
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
@@ -555,35 +557,108 @@ class GPT(nn.Module):
                 # Decode: single token, use cached prev embedding
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
+        return x, cos_sin
 
-        # Forward the trunk of the Transformer
-        x0 = x  # save initial normalized embedding for x0 residual
+    def _run_blocks(self, x, x0, idx, cos_sin, start_layer=0, end_layer=None, kv_cache=None, cached_ve=None):
         n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
+        backout_layer = n_layer // 2
+        end_layer = n_layer if end_layer is None else end_layer
         x_backout = None
-        for i, block in enumerate(self.transformer.h):
+        for i in range(start_layer, end_layer):
+            block = self.transformer.h[i]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            if cached_ve is not None:
+                ve = cached_ve.get(i)
+            else:
+                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
+        return x, x_backout
+
+    def _apply_backout_and_norm(self, x, x_backout):
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        return norm(x)
 
+    def _compute_logits(self, x):
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        return logits
 
+    def _loss_from_logits(self, logits, targets, loss_reduction='mean'):
+        return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+
+    def build_linesearch_cache(self, idx, partial_linesearch_type, kv_cache=None):
+        if partial_linesearch_type not in (1, 2):
+            raise ValueError(f"Unsupported partial_linesearch_type cache request: {partial_linesearch_type}")
+        if kv_cache is not None:
+            raise ValueError("Line search cache does not support kv_cache inference mode")
+
+        x, cos_sin = self._embed_and_smear(idx, kv_cache=kv_cache)
+        x0 = x
+        mid = self.config.n_layer // 2
+
+        cache = {
+            "partial_linesearch_type": partial_linesearch_type,
+            "idx": idx,
+        }
+        if partial_linesearch_type == 1:
+            x_split, _ = self._run_blocks(x, x0, idx, cos_sin, start_layer=0, end_layer=mid, kv_cache=kv_cache)
+            cached_ve = {}
+            for i in range(mid, self.config.n_layer):
+                if str(i) in self.value_embeds:
+                    cached_ve[i] = self.value_embeds[str(i)](idx).to(x_split.dtype)
+            cache.update({
+                "x0": x0,
+                "x_split": x_split,
+                "cos_sin": cos_sin,
+                "cached_ve": cached_ve,
+            })
+        else:
+            x, x_backout = self._run_blocks(x, x0, idx, cos_sin, kv_cache=kv_cache)
+            cache["x_final"] = self._apply_backout_and_norm(x, x_backout)
+        return cache
+
+    def forward_from_linesearch_cache(self, cache, targets=None, loss_reduction='mean'):
+        partial_linesearch_type = cache["partial_linesearch_type"]
+        if partial_linesearch_type == 1:
+            mid = self.config.n_layer // 2
+            x, x_backout = self._run_blocks(
+                cache["x_split"],
+                cache["x0"],
+                cache["idx"],
+                cache["cos_sin"],
+                start_layer=mid,
+                kv_cache=None,
+                cached_ve=cache["cached_ve"],
+            )
+            x = self._apply_backout_and_norm(x, x_backout)
+        elif partial_linesearch_type == 2:
+            x = cache["x_final"]
+        else:
+            raise ValueError(f"Unsupported partial_linesearch_type cache: {partial_linesearch_type}")
+
+        logits = self._compute_logits(x)
+        if targets is not None:
+            return self._loss_from_logits(logits, targets, loss_reduction=loss_reduction)
+        return logits
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+        x, cos_sin = self._embed_and_smear(idx, kv_cache=kv_cache)
+        x0 = x  # save initial normalized embedding for x0 residual
+        x, x_backout = self._run_blocks(x, x0, idx, cos_sin, kv_cache=kv_cache)
+        x = self._apply_backout_and_norm(x, x_backout)
+        logits = self._compute_logits(x)
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            return self._loss_from_logits(logits, targets, loss_reduction=loss_reduction)
         else:
             # inference: just return the logits directly
             return logits
