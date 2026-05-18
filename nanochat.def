@@ -1,0 +1,24 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+%files
+    . /workspace
+
+%post
+    apt-get update && apt-get install -y curl git build-essential && rm -rf /var/lib/apt/lists/*
+
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export UV_PROJECT_ENVIRONMENT="/workspace/.venv"
+    export PATH="/root/.local/bin:$PATH"
+
+    cd /workspace
+    uv sync --frozen --no-dev --extra gpu
+
+%environment
+    export PATH="/workspace/.venv/bin:/root/.local/bin:$PATH"
+    export UV_PROJECT_ENVIRONMENT="/workspace/.venv"
+    export PYTHONPATH="/workspace:$PYTHONPATH"
+
+%runscript
+    cd /workspace
+    exec /workspace/.venv/bin/python "$@"
