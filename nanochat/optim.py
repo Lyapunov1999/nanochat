@@ -7,6 +7,8 @@ Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
+import copy
+import math
 import torch
 import torch.optim as optim
 import torch.distributed as dist
@@ -573,6 +575,41 @@ class OptimizerWithLineSearch():
         self.Ck = float("inf")
         self.Qk = 0
 
+    @property
+    def param_groups(self):
+        return self.ls_opt.param_groups
+
+    def state_dict(self):
+        return {
+            "ls_opt": self.ls_opt.state_dict(),
+            "fixed_opt": self.fixed_opt.state_dict(),
+            "extraLs_opt": None if self.extraLs_opt is None else self.extraLs_opt.state_dict(),
+            "wrapper_state": {
+                "per_parameter": self.per_parameter,
+                "c1": self.c1,
+                "c2": self.c2,
+                "defaultLR_max_mult": self.defaultLR_max_mult,
+                "defaultLR_min_mult": self.defaultLR_min_mult,
+                "max_iter": self.max_iter,
+                "pos_only": self.pos_only,
+                "monotone_strength": self.monotone_strength,
+                "ls_type": self.ls_type,
+                "Ck": self.Ck,
+                "Qk": self.Qk,
+            },
+        }
+
+    def load_state_dict(self, state_dict):
+        self.ls_opt.load_state_dict(state_dict["ls_opt"])
+        self.fixed_opt.load_state_dict(state_dict["fixed_opt"])
+        extra_state = state_dict.get("extraLs_opt")
+        if self.extraLs_opt is not None and extra_state is not None:
+            self.extraLs_opt.load_state_dict(extra_state)
+
+        wrapper_state = state_dict.get("wrapper_state", {})
+        self.Ck = wrapper_state.get("Ck", self.Ck)
+        self.Qk = wrapper_state.get("Qk", self.Qk)
+
     @torch.no_grad()
     def get_direction(self, params, group, closure=None):
         #print(f"get_direction before: group lr={self.ls_opt.param_groups[0]['prev_lr']}")
@@ -595,14 +632,15 @@ class OptimizerWithLineSearch():
         #   to step. Only ls_opt.step() is updated because the line search and is only 
         #   over the subset of parameters handled by ls_opt and the other parameters 
         #   (e.g. from fixed_opt) should produce zero direction
-        if isinstance(self.ls_opt, torch.optim.LBFGS) or isinstance(self.ls_opt, nag):
-            def inner_closure():
-                #self.ls_opt.zero_grad()
-                loss = closure()
-                return loss
-            self.ls_opt.step(inner_closure)
-        else:
-            self.ls_opt.step()
+        # if isinstance(self.ls_opt, torch.optim.LBFGS) or isinstance(self.ls_opt, nag):
+        #     def inner_closure():
+        #         #self.ls_opt.zero_grad()
+        #         loss = closure()
+        #         return loss
+        #     self.ls_opt.step(inner_closure)
+        # else:
+        #     self.ls_opt.step()
+        self.ls_opt.step(closure)
         directions = [((p - p_before)/group['lr']).view(-1) for p_before,p in zip(params_before, params)]
         for p_before, p in zip(params_before, params):
             p.data.copy_(p_before)

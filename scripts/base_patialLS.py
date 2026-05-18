@@ -326,7 +326,7 @@ with open(config_filename, 'r') as f:
     configs = json.load(f)
     exp_conf = configs["experiment_params"]
     opt_conf = configs["optimizer_params"]
-optimizer=model.setup_optimizerwithlinesearch(model, optName, opt_conf)
+optimizer = model.setup_optimizerwithlinesearch(optName, opt_conf)
 is_linesearch_optimizer = hasattr(optimizer, "ls_opt") and hasattr(optimizer, "fixed_opt")
 partial_linesearch_type = opt_conf.get(optName, {}).get("partial_linesearch_type")
 

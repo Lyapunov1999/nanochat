@@ -466,7 +466,7 @@ class GPT(nn.Module):
     #     configs = json.load(f)
     #     exp_conf = configs["experiment_params"]
     #     pt_conf = configs["optimizer_params"]
-    def setup_optimizerwithlinesearch(model, optName, opt_conf):
+    def setup_optimizerwithlinesearch(self, optName, opt_conf):
         #print(f"setOptimizer: optName={optName}, model is {type(model)}")
         optNameRoot = optName
         if "-Wolfe" in optName or "-Armijo" in optName or "-Lip" in optName:
@@ -481,7 +481,7 @@ class GPT(nn.Module):
 
             linesearch_params, fixedLR_params = getParamsDict_optWrapper(
                 opt_conf[optName]["partial_linesearch_type"], 
-                model, "gpt")
+                self, "gpt")
 
             if optNameRoot == "SGD+M":
                 ls_opt = optim.SGD(linesearch_params,lr=opt_conf[optName]["lr"],
@@ -511,7 +511,7 @@ class GPT(nn.Module):
                 ls_type=ls_type)
         else:
             if optNameRoot == "SGD+M": # SGD+M, SGD+M-cosine
-                return optim.SGD(model.parameters(),  lr=opt_conf[optName]["lr"], 
+                return optim.SGD(self.parameters(),  lr=opt_conf[optName]["lr"], 
                     weight_decay=opt_conf[optName]["weight_decay"],
                     momentum=opt_conf[optName]["momentum"])
             else:
