@@ -30,9 +30,7 @@ from nanochat.flash_attention import flash_attn
 from nanochat.utils import getOptNameRoot
 
 
-def getParamsDict_optWrapper(partial_linesearch_type, model, model_type=None):
-    if model_type not in (None, "gpt"):
-        raise ValueError(f"Unsupported model_type for GPT line search wrapper: {model_type}")
+def _getParamsDict_optWrapper(partial_linesearch_type, model):
 
     # ! check the split
     n_layer = len(model.transformer.h)
@@ -479,9 +477,9 @@ class GPT(nn.Module):
             if partial_linesearch_type != opt_conf[optName]["partial_linesearch_type"]:
                 print(f"ERROR: {optName} has partial line search type {partial_linesearch_type} set in json.")
 
-            linesearch_params, fixedLR_params = getParamsDict_optWrapper(
+            linesearch_params, fixedLR_params = _getParamsDict_optWrapper(
                 opt_conf[optName]["partial_linesearch_type"], 
-                self, "gpt")
+                self)
 
             if optNameRoot == "SGD+M":
                 ls_opt = optim.SGD(linesearch_params,lr=opt_conf[optName]["lr"],
