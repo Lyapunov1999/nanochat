@@ -30,46 +30,6 @@ from nanochat.flash_attention import flash_attn
 from nanochat.utils import getOptNameRoot
 
 
-def _getParamsDict_optWrapper(partial_linesearch_type, model):
-
-    # ! check the split
-    n_layer = len(model.transformer.h)
-    mid = n_layer // 2
-
-    embedding_params = list(model.transformer.wte.parameters())
-    value_embeds_params = list(model.value_embeds.parameters())
-    front_block_params = list(model.transformer.h[:mid].parameters())
-    back_block_params = list(model.transformer.h[mid:].parameters())
-    lm_head_params = list(model.lm_head.parameters())
-    scalar_params = [model.resid_lambdas, model.x0_lambdas, model.smear_gate.weight, model.smear_lambda, model.backout_lambda]
-
-    front_params = embedding_params + value_embeds_params + front_block_params + scalar_params
-    back_params = back_block_params + lm_head_params
-    tail_params = lm_head_params
-
-    if partial_linesearch_type == 0:
-        linesearch_params = front_params + back_params
-        fixedLR_params = []
-    elif partial_linesearch_type == 1:
-        linesearch_params = back_params
-        fixedLR_params = front_params
-    elif partial_linesearch_type == 2:
-        linesearch_params = tail_params
-        fixedLR_params = front_params + back_block_params
-    else:
-        raise ValueError(f"Unsupported partial_linesearch_type for GPT: {partial_linesearch_type}")
-
-    all_params = list(model.parameters())
-    expected_ids = {id(p) for p in all_params}
-    linesearch_ids = {id(p) for p in linesearch_params}
-    fixed_ids = {id(p) for p in fixedLR_params}
-    assert len(linesearch_ids) == len(linesearch_params), "Duplicate parameters in linesearch_params"
-    assert len(fixed_ids) == len(fixedLR_params), "Duplicate parameters in fixedLR_params"
-    assert linesearch_ids.isdisjoint(fixed_ids), "Parameters overlap between linesearch and fixed groups"
-    assert linesearch_ids | fixed_ids == expected_ids, "Parameter partition does not cover the full GPT model"
-
-    return [{'params': linesearch_params, 'group_name': 'linesearch_params'}], [{'params': fixedLR_params, 'group_name': 'fixed_params'}]
-
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -242,6 +202,53 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+
+    def _get_params_dict_opt_wrapper(self, partial_linesearch_type, fixed_block_ratio=0.5):
+        if not 0.0 <= fixed_block_ratio <= 1.0:
+            raise ValueError(f"fixed_block_ratio must be in [0, 1], got {fixed_block_ratio}")
+
+        n_layer = len(self.transformer.h)
+        split_idx = n_layer - int(round(n_layer * fixed_block_ratio))
+
+        embedding_params = list(self.transformer.wte.parameters())
+        value_embeds_params = list(self.value_embeds.parameters())
+        front_block_params = list(self.transformer.h[:split_idx].parameters())
+        back_block_params = list(self.transformer.h[split_idx:].parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        scalar_params = [
+            self.resid_lambdas,
+            self.x0_lambdas,
+            self.smear_gate.weight,
+            self.smear_lambda,
+            self.backout_lambda,
+        ]
+
+        front_params = embedding_params + value_embeds_params + front_block_params + scalar_params
+        back_params = back_block_params + lm_head_params
+        tail_params = lm_head_params
+
+        if partial_linesearch_type == 0:
+            linesearch_params = front_params + back_params
+            fixedLR_params = []
+        elif partial_linesearch_type == 1:
+            linesearch_params = back_params
+            fixedLR_params = front_params
+        elif partial_linesearch_type == 2:
+            linesearch_params = tail_params
+            fixedLR_params = front_params + back_block_params
+        else:
+            raise ValueError(f"Unsupported partial_linesearch_type for GPT: {partial_linesearch_type}")
+
+        all_params = list(self.parameters())
+        expected_ids = {id(p) for p in all_params}
+        linesearch_ids = {id(p) for p in linesearch_params}
+        fixed_ids = {id(p) for p in fixedLR_params}
+        assert len(linesearch_ids) == len(linesearch_params), "Duplicate parameters in linesearch_params"
+        assert len(fixed_ids) == len(fixedLR_params), "Duplicate parameters in fixedLR_params"
+        assert linesearch_ids.isdisjoint(fixed_ids), "Parameters overlap between linesearch and fixed groups"
+        assert linesearch_ids | fixed_ids == expected_ids, "Parameter partition does not cover the full GPT model"
+
+        return [{'params': linesearch_params, 'group_name': 'linesearch_params'}], [{'params': fixedLR_params, 'group_name': 'fixed_params'}]
 
     @torch.no_grad()
     def init_weights(self):
@@ -477,9 +484,9 @@ class GPT(nn.Module):
             if partial_linesearch_type != opt_conf[optName]["partial_linesearch_type"]:
                 print(f"ERROR: {optName} has partial line search type {partial_linesearch_type} set in json.")
 
-            linesearch_params, fixedLR_params = _getParamsDict_optWrapper(
+            linesearch_params, fixedLR_params = self._get_params_dict_opt_wrapper(
                 opt_conf[optName]["partial_linesearch_type"], 
-                self)
+                fixed_block_ratio=opt_conf[optName].get("fixed_block_ratio", 0.5))
 
             if optNameRoot == "SGD+M":
                 ls_opt = optim.SGD(linesearch_params,lr=opt_conf[optName]["lr"],
