@@ -7,7 +7,6 @@ Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
-import copy
 import math
 import torch
 import torch.optim as optim
@@ -574,6 +573,7 @@ class OptimizerWithLineSearch():
         self.ls_type = ls_type
         self.Ck = float("inf")
         self.Qk = 0
+        self.step_count = 0
 
     @property
     def param_groups(self):
@@ -596,6 +596,7 @@ class OptimizerWithLineSearch():
                 "ls_type": self.ls_type,
                 "Ck": self.Ck,
                 "Qk": self.Qk,
+                "step_count": self.step_count,
             },
         }
 
@@ -609,45 +610,30 @@ class OptimizerWithLineSearch():
         wrapper_state = state_dict.get("wrapper_state", {})
         self.Ck = wrapper_state.get("Ck", self.Ck)
         self.Qk = wrapper_state.get("Qk", self.Qk)
+        if "step_count" in wrapper_state:
+            self.step_count = int(wrapper_state["step_count"])
+        elif self.ls_opt.param_groups and self.ls_opt.param_groups[0]["params"]:
+            first_param = self.ls_opt.param_groups[0]["params"][0]
+            legacy_step = self.ls_opt.state.get(first_param, {}).get("step")
+            if legacy_step is not None:
+                legacy_step = legacy_step.item() if torch.is_tensor(legacy_step) else legacy_step
+                self.step_count = int(legacy_step) + 1
 
     @torch.no_grad()
     def get_direction(self, params, group, closure=None):
-        #print(f"get_direction before: group lr={self.ls_opt.param_groups[0]['prev_lr']}")
-        #params_before = [p.clone() for p in params]
-        params_before = copy.deepcopy(params)
-        #state_before = copy.deepcopy(self.ls_opt.state_dict())
-        # ls_opt.step() uses the lr (defaultLR) passed in when it was created and so
-        #   we need to undo this to get the `pure' direction. The step size found from
-        #   the line search is not applied via calling step but by updating the 
-        #   parameter directly
-        # group['lr'] contains the default LR and is also the initial value to the LS
-        # group['prev_lr'] contains the calculated LR from the LS
-        # optWrapper is not a torch.optim.Optimizer so its step() function doesn't
-        #   trigger any updates on buffers (e.g. m and v for AdamW). ls_opt.step()
-        #   is needed to update these buffers. ls_opt.step() is only called here and
-        #   the optimizer buffers are updated with the gradients from the last
-        #   iteration before any work with the line search. get_directions is called 
-        #   once per parameter group. If there is just one parameter group, then the
-        #   optimizer buffers (e.g. m and v for AdamW) only gets updated once per call
-        #   to step. Only ls_opt.step() is updated because the line search and is only 
-        #   over the subset of parameters handled by ls_opt and the other parameters 
-        #   (e.g. from fixed_opt) should produce zero direction
-        # if isinstance(self.ls_opt, torch.optim.LBFGS) or isinstance(self.ls_opt, nag):
-        #     def inner_closure():
-        #         #self.ls_opt.zero_grad()
-        #         loss = closure()
-        #         return loss
-        #     self.ls_opt.step(inner_closure)
-        # else:
-        #     self.ls_opt.step()
-        self.ls_opt.step(closure)
+        if len(self.ls_opt.param_groups) != 1:
+            raise NotImplementedError("Wolfe line search currently supports one line-search parameter group")
+        if group is not self.ls_opt.param_groups[0]:
+            raise NotImplementedError("Extra line-search optimizer groups are not supported")
+        if len(params) != len(group["params"]) or any(p is not gp for p, gp in zip(params, group["params"])):
+            raise ValueError("Directions must be generated for the complete line-search parameter group")
+
+        params_before = self._clone_param(params)
+        # The initial closure has already populated gradients. Stepping without a
+        # closure advances momentum once and avoids an extra forward/backward pass.
+        self.ls_opt.step()
         directions = [((p - p_before)/group['lr']).view(-1) for p_before,p in zip(params_before, params)]
-        for p_before, p in zip(params_before, params):
-            p.data.copy_(p_before)
-        #self.ls_opt.load_state_dict(state_before)
-        #del state_before
-        #print(f"get direction after: lr = {self.ls_opt.param_groups[0]['prev_lr']}")
-        #print(directions)
+        self._set_param(params, params_before)
         return torch.cat(directions, 0) # vectorize
 
     def __set_state_defaults(self, state):
@@ -712,6 +698,16 @@ class OptimizerWithLineSearch():
         else:
             group['prev_grad'].copy_(grad)
         group['n_iter'] += 1    
+
+    def __update_nonmonotone_reference(self, loss):
+        loss = float(loss)
+        if self.Ck == float('inf'):
+            self.Ck = loss
+            self.Qk = 1
+            return
+        self.Ck = self.monotone_strength * self.Qk * self.Ck + loss
+        self.Qk = self.monotone_strength * self.Qk + 1
+        self.Ck /= self.Qk
 
     # taken from PyTorch's l-BFGS implementation
     def _numel(self, params, numel_cache):
@@ -785,7 +781,7 @@ class OptimizerWithLineSearch():
     #  or a simpler implementation of strong wolfe (without cubic interpolation to
     #  find next trial step size)
     def __stepsize(self, p, numel_cache, closure, d, grad, loss, 
-     c1, c2, defaultLR):#, lsType="strong_wolfe"):
+     c1, c2, defaultLR, update_reference=True):#, lsType="strong_wolfe"):
         gTd = torch.dot(d,grad)
 
         def objGradFunc(p_fixed, t, d):
@@ -803,12 +799,11 @@ class OptimizerWithLineSearch():
         
         if self.ls_type == "strong_wolfe":
             f = loss.item()
-            if self.Ck==float('inf'):
-                self.Ck = f
+            reference_f = f if self.Ck == float('inf') else self.Ck
             if gTd > 0 and not self.pos_only:
                 f_new, g_new, lr, ls_func_evals = strong_wolfe(objGradFunc, 
                     p.clone(memory_format=torch.contiguous_format), 
-                    defaultLR, d.neg(), f, -gTd, c1=c1, c2=c2, non_monotone_f=self.Ck,
+                    defaultLR, d.neg(), f, grad, -gTd, c1=c1, c2=c2, non_monotone_f=reference_f,
                     min_t=self.defaultLR_min_mult*defaultLR, max_t=self.defaultLR_max_mult*defaultLR)
                 if math.isnan(lr):
                     lr = 0
@@ -818,16 +813,14 @@ class OptimizerWithLineSearch():
             else:
                 f_new, g_new, lr, ls_func_evals = strong_wolfe(objGradFunc, 
                     p.clone(memory_format=torch.contiguous_format), 
-                    defaultLR, d, f, grad, gTd, c1=c1, c2=c2, non_monotone_f=self.Ck,
+                    defaultLR, d, f, grad, gTd, c1=c1, c2=c2, non_monotone_f=reference_f,
                     min_t=self.defaultLR_min_mult*defaultLR, max_t=self.defaultLR_max_mult*defaultLR) 
                 if math.isnan(lr):
                     lr =0
                     f_new = f
                 #print(f" gTd={gTd:>0.4f}, lr={lr:>0.4f}, f={f:0.4f}, f_new={f_new:>0.4f}, ls_func_evals={ls_func_evals}")
-            
-            self.Ck = self.monotone_strength* self.Qk* self.Ck + f_new
-            self.Qk = self.monotone_strength* self.Qk + 1
-            self.Ck/= self.Qk
+            if update_reference:
+                self.__update_nonmonotone_reference(f_new)
         elif self.ls_type == "simple_strong_wolfe":
             if gTd > 0 and not self.pos_only:
                 lr = -1.0* linesearch(objGradFunc, d.neg(), grad, loss, -gTd, 
@@ -860,7 +853,7 @@ class OptimizerWithLineSearch():
     #  or a simpler implementation of strong wolfe (without cubic interpolation to
     #  find next trial step size)
     def __stepsize_no_per_layer(self, pList, numel_cache, closure, d, grad, loss, 
-     c1, c2, defaultLR):#, lsType="strong_wolfe"):
+     c1, c2, defaultLR, update_reference=True):#, lsType="strong_wolfe"):
         gTd = torch.dot(d, grad)
 
         def objGradFunc(x, t, d):
@@ -879,13 +872,11 @@ class OptimizerWithLineSearch():
         pfixed_list = self._clone_param(pList)
         if self.ls_type == "strong_wolfe":
             f = loss.item()
-            if self.Ck==float('inf'):
-                #print("Ck is inf")
-                self.Ck = f
+            reference_f = f if self.Ck == float('inf') else self.Ck
             #print(f"__stepsize_no_per_layer: gTd = {gTd}, f_prev = {f}, Q={self.Qk}, C={self.Ck}")
             if gTd > 0 and not self.pos_only:
                 f_new, g_new, lr, ls_func_evals = strong_wolfe(objGradFunc, pfixed_list, 
-                    defaultLR, d.neg(), f, grad, -gTd, c1=c1, c2=c2, non_monotone_f=self.Ck,
+                    defaultLR, d.neg(), f, grad, -gTd, c1=c1, c2=c2, non_monotone_f=reference_f,
                     min_t=self.defaultLR_min_mult*defaultLR, max_t=self.defaultLR_max_mult*defaultLR)
                 #lr_check = lr
                 f_new_check = f_new
@@ -896,7 +887,7 @@ class OptimizerWithLineSearch():
                 #print(f" gTd={gTd:>0.4f}, lr={lr_check:>0.4f}-->{lr:>0.4f}, f={f:>0.4f}, f_new={f_new_check:>0.4}-->{f_new:>0.4f}, ls_func_evals={ls_func_evals}")
             else:
                 f_new, g_new, lr, ls_func_evals = strong_wolfe(objGradFunc, pfixed_list, 
-                    defaultLR, d, f, grad, gTd, c1=c1, c2=c2, non_monotone_f=self.Ck,
+                    defaultLR, d, f, grad, gTd, c1=c1, c2=c2, non_monotone_f=reference_f,
                     min_t=self.defaultLR_min_mult*defaultLR, max_t=self.defaultLR_max_mult*defaultLR)
                 #lr_check = lr
                 f_new_check = f_new
@@ -904,10 +895,8 @@ class OptimizerWithLineSearch():
                     lr = 0
                     f_new = f
                 #print(f" gTd={gTd:>0.4f}, lr={lr_check:>0.4f}-->{lr:>0.4f}, f={f:0.4f}, f_new={f_new_check:>0.4}-->{f_new:>0.4f}, ls_func_evals={ls_func_evals}")
-            
-            self.Ck = self.monotone_strength* self.Qk* self.Ck + f_new
-            self.Qk = self.monotone_strength* self.Qk + 1
-            self.Ck/= self.Qk
+            if update_reference:
+                self.__update_nonmonotone_reference(f_new)
 
             #print(f"new C = {self.Ck}, new Q = {self.Qk}")
         elif self.ls_type == "simple_strong_wolfe":
@@ -940,126 +929,80 @@ class OptimizerWithLineSearch():
 
     @torch.no_grad()
     def step(self, closure, delay_start_step=0, ls_extra=False, normalize_directions=False):
+        if ls_extra:
+            raise NotImplementedError("Extra line-search optimizer groups are not supported")
+        if len(self.ls_opt.param_groups) != 1:
+            raise NotImplementedError("Wolfe line search currently supports one line-search parameter group")
+
         closure = torch.enable_grad()(closure)
         loss = closure()
+        group = self.ls_opt.param_groups[0]
+        pList = group['params']
+        if not pList:
+            raise ValueError("Line-search optimizer must contain at least one parameter")
+        do_line_search = self.step_count >= delay_start_step
 
-        #print(f"optWrapper.step: {self.ls_type}, {self.ls_opt.param_groups[0]["line_search_fn"]}, {self.monotone_strength}, {self.c1}, {self.c2}")
+        if self.per_parameter:
+            for _ in range(self.max_iter):
+                grad = self._gather_flat_grad(pList)
+                direction = self.get_direction(pList, group)
+                # Search each parameter from the same base point, then apply all
+                # accepted steps together so behavior does not depend on order.
+                updates = []
+                offset = 0
+                for p in pList:
+                    state = self.ls_opt.state[p]
+                    self.__set_state_defaults(state)
+                    numel = p.numel()
+                    d = direction[offset : offset + numel]
+                    p_grad = grad[offset : offset + numel]
+                    offset += numel
+                    if normalize_directions:
+                        norm = (d**2).sum()**0.5
+                        if norm > 1e-4:
+                            d = d / norm
+                    defaultLR = group['lr']
+                    if do_line_search:
+                        lr, gTd = self.__stepsize(
+                            p, state['numel_cache'], closure, d, p_grad,
+                            loss, self.c1, self.c2, defaultLR, update_reference=False,
+                        )
+                    else:
+                        lr = defaultLR
+                        gTd = torch.dot(d, p_grad)
+                    self.__update_state(state, loss, lr, d, p_grad, gTd)
+                    updates.append((p, state, lr, d))
 
-        all_done = True
-        if ls_extra:
-            param_groups_to_use = self.extraLs_opt.param_groups
+                for p, state, lr, d in updates:
+                    self._add_grad([p], state['numel_cache'], lr, d)
+                loss = closure()
+                if do_line_search and self.ls_type == "strong_wolfe":
+                    self.__update_nonmonotone_reference(loss)
         else:
-            param_groups_to_use = self.ls_opt.param_groups
-        #for group_idx, group in enumerate(self.ls_opt.param_groups):
-        for group_idx, group in enumerate(param_groups_to_use):
-            pList = group['params']
-            #print(group.keys())
-            try:
-                num_step = self.ls_opt.state[pList[0]]['step']
-                if isinstance(self.ls_opt, optim.SGD):
-                    self.ls_opt.state[pList[0]]['step'] += 1
-                #print(f"1:{self.ls_opt.state[pList[0]].keys()}")
-            except KeyError:
-                num_step = 0
-                if isinstance(self.ls_opt, optim.SGD):
-                    self.ls_opt.state[pList[0]]['step'] = 0
-                #print(f"2:{self.ls_opt.state[pList[0]].keys()}")
+            self.__set_group_defaults(group)
+            for _ in range(self.max_iter):
+                grad = self._gather_flat_grad(pList)
+                d = self.get_direction(pList, group)
+                if normalize_directions:
+                    norm = (d**2).sum()**0.5
+                    if norm > 1e-4:
+                        d /= norm
+                defaultLR = group['lr']
+                if do_line_search:
+                    lr, gTd = self.__stepsize_no_per_layer(
+                        pList, group['numel_cache'], closure, d, grad,
+                        loss, self.c1, self.c2, defaultLR,
+                    )
+                else:
+                    lr = defaultLR
+                    gTd = torch.dot(d, grad)
+                self.__update_group(group, loss, lr, d, grad, gTd)
+                self._add_grad(pList, group['numel_cache'], lr, d)
+                loss = closure()
 
-            if self.per_parameter:
-                n_iter = 0
-                while n_iter < self.max_iter:
-                    n_iter += 1
-                    for p_idx, p in enumerate(pList):
-                        state = self.ls_opt.state[p]
-                        self.__set_state_defaults(state)
-                        if not state['done']:
-                            grad = self._gather_flat_grad([p])
-                            #if grad.abs().max() <= 1e-7: # TODO: make optimality check configurable
-                            #    print("  ***optimality condition met")
-                            #    continue
-
-                            d = self.get_direction([p], group, closure=closure)
-                            if normalize_directions:
-                                norm = (d**2).sum()**0.5
-                                if norm > 1e-4:
-                                    d /= norm
-                            defaultLR = group['lr']
-
-                            if num_step >= delay_start_step:
-                                lr, gTd = self.__stepsize(p, state['numel_cache'], closure, d, grad, 
-                                    loss, self.c1, self.c2, defaultLR)
-                                #if lr > 0 and lr < defaultLR:
-                                #    lr = defaultLR
-                            else:
-                                lr = defaultLR
-                                gTd = torch.dot(d, grad)
-
-                            self.__update_state(state, loss, lr, d, grad, gTd)
-                            self._add_grad([p], state['numel_cache'], lr, d)
-
-                            #if d.mul(lr).abs().max() < 1e-9: # TODO: make progress check configurable
-                            #    print("  ***lack of progress")
-                            #    continue
-
-                        # check again if we're done here
-                        if not state['done']:
-                            all_done = False
-                    loss = closure()
-            else:
-                # store everything in group[blah]
-                self.__set_group_defaults(group)
-                if not group['done']:
-                    n_iter = 0
-                    #print(f"About to process group {group_idx}: {n_iter}, {self.max_iter}")
-                    while n_iter < self.max_iter:
-                        grad = self._gather_flat_grad(pList)
-
-                        #if grad.abs().max() <= 1e-7: # TODO: make optimality check configurable
-                        #    print(f"  ***optimality condition met: {grad.abs().max()}")
-                        #    #break
-
-                        n_iter += 1
-
-                        d = self.get_direction(pList, group, closure=closure)
-                        if normalize_directions:
-                            norm = (d**2).sum()**0.5
-                            if norm > 1e-4:
-                                d /= norm
-                        defaultLR = group['lr']
-
-                        if num_step >= delay_start_step:
-                            lr, gTd= self.__stepsize_no_per_layer(pList, group['numel_cache'],
-                                closure, d, grad, loss, self.c1, self.c2, defaultLR)
-                            #print(f"stepsize_no_per_layer returns lr={lr}")
-                            #if lr > 0 and lr < defaultLR:
-                            #    lr = defaultLR
-                        else:
-                            lr = defaultLR
-                            gTd = torch.dot(d, grad)
-                        
-                        self.__update_group(group, loss, lr, d, grad, gTd)
-                        #print(f"group['prev_lr'] is {group['prev_lr']} for group number {group_idx}")
-                        self._add_grad(pList, group['numel_cache'], lr, d)
-
-                        #if d.mul(lr).abs().max() < 1e-9: # TODO: make progress check configurable
-                        #    print("  ***lack of progress")
-                        #    #break
-                        #
-                        #    print(f" n_iter={n_iter}/ group[n_iter]={group['n_iter']}: n pos lr={group['n_pos_lr']},"
-                        #    f" n neg lr={group['n_neg_lr']}, gTd={gTd:>0.4f}, lr={lr:>0.4f},"
-                        #    f" f={float(loss):>0.4f}, norm(g)={torch.linalg.vector_norm(grad):>0.4f},"
-                        #    f" norm(d)={torch.linalg.vector_norm(d):>0.4f}")
-                        loss = closure()
-                        #print(f"idx={group_idx}, id(group)={id(group)}, step: after closure(): lr={lr}, group lr={group['prev_lr']}")
-                
-                # check again if we're done here
-                if not group['done']:
-                    all_done = False
-
-        #print("before returning from step")
-        #for group_idx, group in enumerate(self.ls_opt.param_groups):
-        #    print(f"group_idx={group_idx}, id(group)={id(group)}: lr={group['prev_lr']}, gtd={group['prev_gTd']}, f={group['prev_f']}")
-        return loss, all_done
+        self.step_count += 1
+        # Reserved for an inner-loop convergence test that is not implemented.
+        return loss, False
 
     def step_extra(self, closure, delay_start_step=0):
         return self.step(closure, delay_start_step=delay_start_step, ls_extra=True)

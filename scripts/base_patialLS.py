@@ -329,6 +329,11 @@ with open(config_filename, 'r') as f:
 optimizer = model.setup_optimizerwithlinesearch(optName, opt_conf)
 is_linesearch_optimizer = hasattr(optimizer, "ls_opt") and hasattr(optimizer, "fixed_opt")
 partial_linesearch_type = opt_conf.get(optName, {}).get("partial_linesearch_type")
+if is_linesearch_optimizer and ddp:
+    raise NotImplementedError(
+        "Partial line search currently supports single-process training only; "
+        "distributed trial loss/gradient synchronization is not implemented."
+    )
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -555,7 +560,7 @@ while True:
                 loss_closure.backward()
                 return loss_closure
 
-            loss, all_done = optimizer.step(
+            loss, _ = optimizer.step(
                 closure=closure,
                 delay_start_step=opt_conf[optName]["delay_start_step"],
             )
@@ -579,7 +584,6 @@ while True:
             raise ValueError(f"Unsupported line search optimizer path for optName={optName}")
         x, y, dataloader_state_dict = next(train_loader)
     else:
-        all_done = False
         # ! we don't do accumulation
         for micro_step in range(grad_accum_steps):
             loss = model(x, y)
@@ -656,8 +660,6 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
-        if is_linesearch_optimizer:
-            log_data["train/all_done"] = float(all_done)
         wandb_run.log(log_data)
 
     # state update
