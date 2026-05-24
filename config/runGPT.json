@@ -22,7 +22,7 @@
         "SGD+M-Wolfe-2": {"lr": 5e-3, "weight_decay": 0.0, "momentum": 0.9,
             "c1": 1e-4, "c2": 0.9, "monotone_strength": 0.0, "delay_start_step": 0,
             "defaultLR_max_mult": 1e5, "defaultLR_min_mult": 1e-1,
-            "partial_linesearch_type": 2, "fixed_block_ratio": 0.5 },
+            "partial_linesearch_type": 2, "fixed_block_ratio": 0.2 },
         "AdamW-Wolfe-2": {"lr": 1e-3, "weight_decay": 0.0, "betas": [0.9, 0.999],
             "c1": 1e-4, "c2": 0.9, "monotone_strength": 0.0, "delay_start_step": 0,
             "defaultLR_max_mult": 1e5, "defaultLR_min_mult": 1e-1,
