@@ -567,6 +567,7 @@ while True:
                 closure=closure,
                 delay_start_step=opt_conf[optName]["delay_start_step"],
             )
+            line_search_evals = optimizer.last_line_search_evals
             train_loss = loss.detach()
 
             # ! check the bcd part
@@ -621,8 +622,10 @@ while True:
             optimizer.step()
     if not is_linesearch_optimizer:
         lrm_for_log = lrm
+        line_search_log = ""
     else:
         lrm_for_log = optimizer.ls_opt.param_groups[0]["lr"]
+        line_search_log = f" | ls_evals: {line_search_evals}"
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -650,7 +653,7 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm_for_log:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm_for_log:.2f}{line_search_log} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -663,6 +666,8 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if is_linesearch_optimizer:
+            log_data["train/ls_evals"] = line_search_evals
         wandb_run.log(log_data)
 
     # state update

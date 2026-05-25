@@ -33,6 +33,26 @@ def test_group_direction_generation_does_not_recompute_closure():
     torch.testing.assert_close(p, torch.tensor([0.9]))
     assert calls == 2
     assert all_done is False
+    assert wrapper.last_line_search_evals == 0
+
+
+def test_reports_only_line_search_trial_evaluations():
+    p = torch.nn.Parameter(torch.tensor([1.0]))
+    wrapper, ls_opt = _make_wrapper([p])
+    calls = 0
+
+    def closure():
+        nonlocal calls
+        calls += 1
+        ls_opt.zero_grad()
+        loss = 0.5 * p.square().sum()
+        loss.backward()
+        return loss
+
+    wrapper.step(closure)
+
+    assert wrapper.last_line_search_evals >= 1
+    assert wrapper.last_line_search_evals == calls - 2
 
 
 def test_per_parameter_delayed_step_does_not_leak_updates():

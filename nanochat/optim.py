@@ -574,6 +574,7 @@ class OptimizerWithLineSearch():
         self.Ck = float("inf")
         self.Qk = 0
         self.step_count = 0
+        self.last_line_search_evals = 0
 
     @property
     def param_groups(self):
@@ -783,8 +784,11 @@ class OptimizerWithLineSearch():
     def __stepsize(self, p, numel_cache, closure, d, grad, loss, 
      c1, c2, defaultLR, update_reference=True):#, lsType="strong_wolfe"):
         gTd = torch.dot(d,grad)
+        line_search_evals = 0
 
         def objGradFunc(p_fixed, t, d):
+            nonlocal line_search_evals
+            line_search_evals += 1
             self._add_grad([p], numel_cache, t, d)
             f_new = closure()
             g_new = self._gather_flat_grad([p])
@@ -792,6 +796,8 @@ class OptimizerWithLineSearch():
             return float(f_new), g_new
         
         def objFunc(p_fixed, t, d):
+            nonlocal line_search_evals
+            line_search_evals += 1
             self._add_grad([p], numel_cache, t, d)
             f_new = closure()
             self._set_param([p], [p_fixed])
@@ -845,7 +851,7 @@ class OptimizerWithLineSearch():
             lr = defaultLR
             print(f"Unrecognized lsType {self.ls_type}. Using default LR={lr}.")
 
-        return lr, gTd
+        return lr, gTd, line_search_evals
     
     # this version is for no per-layer parameters 
     #  returns the step size and directional derivative given search direction d
@@ -855,8 +861,11 @@ class OptimizerWithLineSearch():
     def __stepsize_no_per_layer(self, pList, numel_cache, closure, d, grad, loss, 
      c1, c2, defaultLR, update_reference=True):#, lsType="strong_wolfe"):
         gTd = torch.dot(d, grad)
+        line_search_evals = 0
 
         def objGradFunc(x, t, d):
+            nonlocal line_search_evals
+            line_search_evals += 1
             self._add_grad(pList, numel_cache, t, d)
             f_new = closure()
             g_new = self._gather_flat_grad(pList)
@@ -864,6 +873,8 @@ class OptimizerWithLineSearch():
             return float(f_new), g_new
     
         def objFunc(x, t, d):
+            nonlocal line_search_evals
+            line_search_evals += 1
             self._add_grad(pList, numel_cache, t, d)
             f_new = closure()
             self._set_param(pList, x)
@@ -925,7 +936,7 @@ class OptimizerWithLineSearch():
             lr = defaultLR
             print(f"__stepsize_no_per_layer: Unrecognized lsType {self.ls_type}. Using default LR={lr}.")
             
-        return lr, gTd
+        return lr, gTd, line_search_evals
 
     @torch.no_grad()
     def step(self, closure, delay_start_step=0, ls_extra=False, normalize_directions=False):
@@ -941,6 +952,7 @@ class OptimizerWithLineSearch():
         if not pList:
             raise ValueError("Line-search optimizer must contain at least one parameter")
         do_line_search = self.step_count >= delay_start_step
+        self.last_line_search_evals = 0
 
         if self.per_parameter:
             for _ in range(self.max_iter):
@@ -963,10 +975,11 @@ class OptimizerWithLineSearch():
                             d = d / norm
                     defaultLR = group['lr']
                     if do_line_search:
-                        lr, gTd = self.__stepsize(
+                        lr, gTd, line_search_evals = self.__stepsize(
                             p, state['numel_cache'], closure, d, p_grad,
                             loss, self.c1, self.c2, defaultLR, update_reference=False,
                         )
+                        self.last_line_search_evals += line_search_evals
                     else:
                         lr = defaultLR
                         gTd = torch.dot(d, p_grad)
@@ -989,10 +1002,11 @@ class OptimizerWithLineSearch():
                         d /= norm
                 defaultLR = group['lr']
                 if do_line_search:
-                    lr, gTd = self.__stepsize_no_per_layer(
+                    lr, gTd, line_search_evals = self.__stepsize_no_per_layer(
                         pList, group['numel_cache'], closure, d, grad,
                         loss, self.c1, self.c2, defaultLR,
                     )
+                    self.last_line_search_evals += line_search_evals
                 else:
                     lr = defaultLR
                     gTd = torch.dot(d, grad)
