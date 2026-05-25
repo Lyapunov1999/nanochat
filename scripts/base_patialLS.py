@@ -329,6 +329,7 @@ with open(config_filename, 'r') as f:
 optimizer = model.setup_optimizerwithlinesearch(optName, opt_conf)
 is_linesearch_optimizer = hasattr(optimizer, "ls_opt") and hasattr(optimizer, "fixed_opt")
 partial_linesearch_type = opt_conf.get(optName, {}).get("partial_linesearch_type")
+fixed_block_ratio = opt_conf.get(optName, {}).get("fixed_block_ratio", 0.5)
 if is_linesearch_optimizer and ddp:
     raise NotImplementedError(
         "Partial line search currently supports single-process training only; "
@@ -549,7 +550,9 @@ while True:
 
             if partial_linesearch_type in (1, 2):
                 with torch.no_grad():
-                    cached_forward = orig_model.build_linesearch_cache(x, partial_linesearch_type)
+                    cached_forward = orig_model.build_linesearch_cache(
+                        x, partial_linesearch_type, fixed_block_ratio=fixed_block_ratio
+                    )
 
             def closure():
                 optimizer.ls_opt.zero_grad()

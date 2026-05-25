@@ -203,12 +203,15 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
-    def _get_params_dict_opt_wrapper(self, partial_linesearch_type, fixed_block_ratio=0.5):
+    def _get_linesearch_split_idx(self, fixed_block_ratio):
         if not 0.0 <= fixed_block_ratio <= 1.0:
             raise ValueError(f"fixed_block_ratio must be in [0, 1], got {fixed_block_ratio}")
 
         n_layer = len(self.transformer.h)
-        split_idx = n_layer - int(round(n_layer * fixed_block_ratio))
+        return n_layer - int(round(n_layer * fixed_block_ratio))
+
+    def _get_params_dict_opt_wrapper(self, partial_linesearch_type, fixed_block_ratio=0.5):
+        split_idx = self._get_linesearch_split_idx(fixed_block_ratio)
 
         embedding_params = list(self.transformer.wte.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
@@ -599,7 +602,7 @@ class GPT(nn.Module):
     def _loss_from_logits(self, logits, targets, loss_reduction='mean'):
         return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
-    def build_linesearch_cache(self, idx, partial_linesearch_type, kv_cache=None):
+    def build_linesearch_cache(self, idx, partial_linesearch_type, kv_cache=None, *, fixed_block_ratio=0.5):
         if partial_linesearch_type not in (1, 2):
             raise ValueError(f"Unsupported partial_linesearch_type cache request: {partial_linesearch_type}")
         if kv_cache is not None:
@@ -607,21 +610,25 @@ class GPT(nn.Module):
 
         x, cos_sin = self._embed_and_smear(idx, kv_cache=kv_cache)
         x0 = x
-        mid = self.config.n_layer // 2
 
         cache = {
             "partial_linesearch_type": partial_linesearch_type,
             "idx": idx,
         }
         if partial_linesearch_type == 1:
-            x_split, _ = self._run_blocks(x, x0, idx, cos_sin, start_layer=0, end_layer=mid, kv_cache=kv_cache)
+            split_idx = self._get_linesearch_split_idx(fixed_block_ratio)
+            x_split, x_backout = self._run_blocks(
+                x, x0, idx, cos_sin, start_layer=0, end_layer=split_idx, kv_cache=kv_cache
+            )
             cached_ve = {}
-            for i in range(mid, self.config.n_layer):
+            for i in range(split_idx, self.config.n_layer):
                 if str(i) in self.value_embeds:
                     cached_ve[i] = self.value_embeds[str(i)](idx).to(x_split.dtype)
             cache.update({
                 "x0": x0,
                 "x_split": x_split,
+                "x_backout": x_backout,
+                "split_idx": split_idx,
                 "cos_sin": cos_sin,
                 "cached_ve": cached_ve,
             })
@@ -633,16 +640,16 @@ class GPT(nn.Module):
     def forward_from_linesearch_cache(self, cache, targets=None, loss_reduction='mean'):
         partial_linesearch_type = cache["partial_linesearch_type"]
         if partial_linesearch_type == 1:
-            mid = self.config.n_layer // 2
-            x, x_backout = self._run_blocks(
+            x, suffix_backout = self._run_blocks(
                 cache["x_split"],
                 cache["x0"],
                 cache["idx"],
                 cache["cos_sin"],
-                start_layer=mid,
+                start_layer=cache["split_idx"],
                 kv_cache=None,
                 cached_ve=cache["cached_ve"],
             )
+            x_backout = suffix_backout if suffix_backout is not None else cache["x_backout"]
             x = self._apply_backout_and_norm(x, x_backout)
         elif partial_linesearch_type == 2:
             x = cache["x_final"]
