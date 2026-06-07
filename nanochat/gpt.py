@@ -483,6 +483,52 @@ class GPT(nn.Module):
             group["kind"] = "adamw"
             group["initial_lr"] = group["lr"]
         return optimizer
+
+    def _build_muon_adamw_groups_for_params(self, params, conf):
+        param_ids = {id(p) for p in params}
+
+        def selected(module_params):
+            return [p for p in module_params if id(p) in param_ids]
+
+        matrix_params = selected(self.transformer.h.parameters())
+        lm_head_params = selected(self.lm_head.parameters())
+        embedding_params = selected(self.transformer.wte.parameters())
+        value_embeds_params = selected(self.value_embeds.parameters())
+        resid_params = selected([self.resid_lambdas])
+        x0_params = selected([self.x0_lambdas])
+        smear_params = selected([self.smear_gate.weight, self.smear_lambda, self.backout_lambda])
+
+        lr = conf["lr"]
+        betas = tuple(conf.get("betas", (0.9, 0.999)))
+        eps = conf.get("eps", 1e-8)
+        adamw_weight_decay = conf.get("adamw_weight_decay", conf.get("weight_decay", 0.0))
+        matrix_lr = conf.get("matrix_lr", lr)
+        muon_weight_decay = conf.get("muon_weight_decay", conf.get("weight_decay", 0.0))
+        momentum = conf.get("momentum", 0.95)
+        ns_steps = conf.get("ns_steps", 5)
+        beta2 = conf.get("beta2", 0.9)
+
+        param_groups = []
+        for group_params in (lm_head_params, embedding_params, value_embeds_params, resid_params, x0_params, smear_params):
+            if group_params:
+                param_groups.append(dict(
+                    kind="adamw", params=group_params, lr=lr,
+                    betas=betas, eps=eps, weight_decay=adamw_weight_decay,
+                ))
+
+        for shape in sorted({p.shape for p in matrix_params}):
+            group_params = [p for p in matrix_params if p.shape == shape]
+            param_groups.append(dict(
+                kind="muon", params=group_params, lr=matrix_lr,
+                momentum=momentum, ns_steps=ns_steps, beta2=beta2, weight_decay=muon_weight_decay,
+            ))
+
+        if not param_groups:
+            param_groups.append(dict(
+                kind="adamw", params=[], lr=lr,
+                betas=betas, eps=eps, weight_decay=adamw_weight_decay,
+            ))
+        return param_groups
     
     # ! copied from partialLS
     # model is gpt, optName is "SGD+M-Wolfe-2"
@@ -498,7 +544,13 @@ class GPT(nn.Module):
                 ls_type = "strong_wolfe"
                 optNameRoot, per_parameter, pos_only, partial_linesearch_type = getOptNameRoot(
                     optName, "-Wolfe")
-                
+            elif "-Armijo" in optName:
+                ls_type = "armijo"
+                optNameRoot, per_parameter, pos_only, partial_linesearch_type = getOptNameRoot(
+                    optName, "-Armijo")
+            else:
+                print(f"setOptimizer: unhandled line search type in optimizer {optName}.")
+                return None
 
             if partial_linesearch_type != opt_conf[optName]["partial_linesearch_type"]:
                 print(f"ERROR: {optName} has partial line search type {partial_linesearch_type} set in json.")
@@ -514,7 +566,20 @@ class GPT(nn.Module):
                 fixed_opt = optim.SGD(fixedLR_params, lr=opt_conf[optName]["lr"],
                     weight_decay=opt_conf[optName]["weight_decay"],
                     momentum=opt_conf[optName]["momentum"])
-            
+            elif optNameRoot == "AdamW":
+                betas = tuple(opt_conf[optName].get("betas", (0.9, 0.999)))
+                eps = opt_conf[optName].get("eps", 1e-8)
+                ls_opt = optim.AdamW(linesearch_params, lr=opt_conf[optName]["lr"],
+                    weight_decay=opt_conf[optName]["weight_decay"],
+                    betas=betas, eps=eps)
+                fixed_opt = optim.AdamW(fixedLR_params, lr=opt_conf[optName]["lr"],
+                    weight_decay=opt_conf[optName]["weight_decay"],
+                    betas=betas, eps=eps)
+            elif optNameRoot == "MuonAdamW":
+                linesearch_param_list = linesearch_params[0]["params"]
+                fixed_param_list = fixedLR_params[0]["params"]
+                ls_opt = MuonAdamW(self._build_muon_adamw_groups_for_params(linesearch_param_list, opt_conf[optName]))
+                fixed_opt = MuonAdamW(self._build_muon_adamw_groups_for_params(fixed_param_list, opt_conf[optName]))
             else:
                 print(f"setOptimizer: unhandled optimizer {optName}.")
                 return None

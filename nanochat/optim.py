@@ -592,6 +592,12 @@ class OptimizerWithLineSearch():
     def param_groups(self):
         return self.ls_opt.param_groups
 
+    def _line_search_params(self):
+        return [p for group in self.ls_opt.param_groups for p in group["params"]]
+
+    def _uses_single_lr_direction(self):
+        return len(self.ls_opt.param_groups) == 1
+
     def state_dict(self):
         return {
             "ls_opt": self.ls_opt.state_dict(),
@@ -634,18 +640,22 @@ class OptimizerWithLineSearch():
 
     @torch.no_grad()
     def get_direction(self, params, group, closure=None):
-        if len(self.ls_opt.param_groups) != 1:
-            raise NotImplementedError("Wolfe line search currently supports one line-search parameter group")
-        if group is not self.ls_opt.param_groups[0]:
-            raise NotImplementedError("Extra line-search optimizer groups are not supported")
-        if len(params) != len(group["params"]) or any(p is not gp for p, gp in zip(params, group["params"])):
+        if self._uses_single_lr_direction():
+            expected_params = self.ls_opt.param_groups[0]["params"]
+        else:
+            expected_params = self._line_search_params()
+        if len(params) != len(expected_params) or any(p is not ep for p, ep in zip(params, expected_params)):
             raise ValueError("Directions must be generated for the complete line-search parameter group")
 
         params_before = self._clone_param(params)
         # The initial closure has already populated gradients. Stepping without a
         # closure advances momentum once and avoids an extra forward/backward pass.
         self.ls_opt.step()
-        directions = [((p - p_before)/group['lr']).view(-1) for p_before,p in zip(params_before, params)]
+        if self._uses_single_lr_direction():
+            scale = group["lr"]
+            directions = [((p - p_before) / scale).view(-1) for p_before, p in zip(params_before, params)]
+        else:
+            directions = [(p - p_before).view(-1) for p_before, p in zip(params_before, params)]
         self._set_param(params, params_before)
         return torch.cat(directions, 0) # vectorize
 
@@ -954,13 +964,16 @@ class OptimizerWithLineSearch():
     def step(self, closure, delay_start_step=0, ls_extra=False, normalize_directions=False):
         if ls_extra:
             raise NotImplementedError("Extra line-search optimizer groups are not supported")
-        if len(self.ls_opt.param_groups) != 1:
-            raise NotImplementedError("Wolfe line search currently supports one line-search parameter group")
+        if self.per_parameter and not self._uses_single_lr_direction():
+            raise NotImplementedError("Per-parameter line search is only supported for single-group optimizers")
 
         closure = torch.enable_grad()(closure)
         loss = closure()
-        group = self.ls_opt.param_groups[0]
-        pList = group['params']
+        group = self.ls_opt.param_groups[0] if self._uses_single_lr_direction() else {
+            "params": self._line_search_params(),
+            "lr": 1.0,
+        }
+        pList = group["params"]
         if not pList:
             raise ValueError("Line-search optimizer must contain at least one parameter")
         do_line_search = self.step_count >= delay_start_step

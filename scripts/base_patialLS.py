@@ -64,6 +64,7 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--opt-name", type=str, default="SGD+M-Wolfe-2", help="optimizer config key from config/runGPT.json")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -319,14 +320,17 @@ if weight_decay_scaled != args.weight_decay:
 # )
 
 
-# ! check this
-optName="SGD+M-Wolfe-2"
+optName = args.opt_name
 config_filename = f"config/runGPT.json"
 with open(config_filename, 'r') as f:
     configs = json.load(f)
     exp_conf = configs["experiment_params"]
     opt_conf = configs["optimizer_params"]
+if optName not in opt_conf:
+    raise ValueError(f"Unknown opt-name {optName}; expected a key in {config_filename}")
 optimizer = model.setup_optimizerwithlinesearch(optName, opt_conf)
+if optimizer is None:
+    raise ValueError(f"Failed to initialize optimizer {optName}")
 is_linesearch_optimizer = hasattr(optimizer, "ls_opt") and hasattr(optimizer, "fixed_opt")
 partial_linesearch_type = opt_conf.get(optName, {}).get("partial_linesearch_type")
 fixed_block_ratio = opt_conf.get(optName, {}).get("fixed_block_ratio", 0.5)

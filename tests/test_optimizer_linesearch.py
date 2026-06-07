@@ -1,6 +1,7 @@
 import torch
 
-from nanochat.optim import OptimizerWithLineSearch
+from nanochat.gpt import GPT, GPTConfig
+from nanochat.optim import MuonAdamW, OptimizerWithLineSearch
 
 
 def _make_wrapper(params, *, lr=0.1, momentum=0.0, per_parameter=False):
@@ -101,10 +102,10 @@ def test_per_parameter_wolfe_search_is_independent_of_parameter_order():
     torch.testing.assert_close(forward[1], reverse[1])
 
 
-def test_multiple_line_search_parameter_groups_are_rejected():
+def test_multiple_line_search_parameter_groups_are_supported():
     p1 = torch.nn.Parameter(torch.tensor([1.0]))
     p2 = torch.nn.Parameter(torch.tensor([2.0]))
-    ls_opt = torch.optim.SGD([{"params": [p1]}, {"params": [p2]}], lr=0.1)
+    ls_opt = torch.optim.SGD([{"params": [p1], "lr": 0.1}, {"params": [p2], "lr": 0.2}])
     fixed_opt = torch.optim.SGD([{"params": []}], lr=0.1)
     wrapper = OptimizerWithLineSearch(ls_opt, fixed_opt)
 
@@ -114,11 +115,64 @@ def test_multiple_line_search_parameter_groups_are_rejected():
         loss.backward()
         return loss
 
-    try:
-        wrapper.step(closure)
-    except NotImplementedError:
-        return
-    raise AssertionError("Expected multiple line-search groups to be rejected")
+    wrapper.step(closure, delay_start_step=1)
+
+    torch.testing.assert_close(p1, torch.tensor([0.9]))
+    torch.testing.assert_close(p2, torch.tensor([1.6]))
+
+
+def test_adamw_line_search_optimizer_is_supported():
+    p = torch.nn.Parameter(torch.tensor([1.0]))
+    ls_opt = torch.optim.AdamW([{"params": [p]}], lr=0.1, weight_decay=0.0)
+    fixed_opt = torch.optim.AdamW([{"params": []}], lr=0.1, weight_decay=0.0)
+    wrapper = OptimizerWithLineSearch(ls_opt, fixed_opt)
+
+    def closure():
+        ls_opt.zero_grad()
+        loss = 0.5 * p.square().sum()
+        loss.backward()
+        return loss
+
+    wrapper.step(closure)
+
+    assert p.item() < 1.0
+    assert wrapper.last_line_search_evals >= 1
+
+
+def test_gpt_muon_adamw_linesearch_groups_cover_partial_types():
+    conf = {
+        "lr": 1e-3,
+        "matrix_lr": 0.02,
+        "weight_decay": 0.0,
+        "betas": [0.9, 0.999],
+        "momentum": 0.95,
+        "ns_steps": 5,
+        "beta2": 0.9,
+        "c1": 1e-4,
+        "c2": 0.9,
+        "monotone_strength": 0.0,
+        "delay_start_step": 0,
+        "defaultLR_max_mult": 1e5,
+        "defaultLR_min_mult": 1e-1,
+        "fixed_block_ratio": 0.5,
+    }
+    model = GPT(GPTConfig(sequence_len=16, vocab_size=128, n_layer=2, n_head=2, n_kv_head=2, n_embd=32))
+
+    for partial_type in (0, 1, 2):
+        opt_name = f"MuonAdamW-Wolfe-{partial_type}"
+        opt_conf = {opt_name: dict(conf, partial_linesearch_type=partial_type)}
+        wrapper = model.setup_optimizerwithlinesearch(opt_name, opt_conf)
+        assert isinstance(wrapper.ls_opt, MuonAdamW)
+        assert isinstance(wrapper.fixed_opt, MuonAdamW)
+
+        ls_params = [p for group in wrapper.ls_opt.param_groups for p in group["params"]]
+        fixed_params = [p for group in wrapper.fixed_opt.param_groups for p in group["params"]]
+        all_ids = {id(p) for p in model.parameters()}
+        assert {id(p) for p in ls_params}.isdisjoint({id(p) for p in fixed_params})
+        assert {id(p) for p in ls_params} | {id(p) for p in fixed_params} == all_ids
+
+        if partial_type in (0, 1):
+            assert any(group["kind"] == "muon" for group in wrapper.ls_opt.param_groups)
 
 
 def test_negative_wolfe_step_handles_momentum_ascent_direction():
