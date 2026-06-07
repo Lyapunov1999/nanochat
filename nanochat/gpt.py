@@ -22,7 +22,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW, DistMuonAdamW, OptimizerWithLineSearch
+from nanochat.optim import MuonAdamW, DistMuonAdamW, OptimizerWithLineSearch, create_adamw_optimizer
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -465,6 +465,22 @@ class GPT(nn.Module):
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
         for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
+
+    def setup_adamw_optimizer(self, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+        ddp, rank, local_rank, world_size = get_dist_info()
+        if ddp:
+            raise RuntimeError("AdamW-only optimizer uses torch.optim.AdamW and only supports single-process training")
+        optimizer = create_adamw_optimizer(
+            self.parameters(),
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+        for group in optimizer.param_groups:
+            group["kind"] = "adamw"
             group["initial_lr"] = group["lr"]
         return optimizer
     

@@ -21,6 +21,18 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
+def create_adamw_optimizer(
+    params,
+    lr: float = 1e-3,
+    betas: tuple[float, float] = (0.9, 0.999),
+    eps: float = 1e-8,
+    weight_decay: float = 0.0,
+) -> optim.AdamW:
+    """
+    Simple whole-model AdamW optimizer using PyTorch's built-in implementation.
+    """
+    return optim.AdamW(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor

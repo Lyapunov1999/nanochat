@@ -65,6 +65,12 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "adamw"], help="optimizer to use for pretraining")
+parser.add_argument("--adamw-lr", type=float, default=1e-3, help="learning rate for whole-model AdamW")
+parser.add_argument("--adamw-beta1", type=float, default=0.9, help="beta1 for whole-model AdamW")
+parser.add_argument("--adamw-beta2", type=float, default=0.999, help="beta2 for whole-model AdamW")
+parser.add_argument("--adamw-eps", type=float, default=1e-8, help="epsilon for whole-model AdamW")
+parser.add_argument("--adamw-weight-decay", type=float, default=0.0, help="weight decay for whole-model AdamW")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -309,16 +315,29 @@ if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-)
+# Initialize the Optimizer
+if args.optimizer == "muon":
+    # Combined MuonAdamW: Muon for matrix params, AdamW for rest
+    optimizer = model.setup_optimizer(
+        # AdamW hyperparameters
+        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        embedding_lr=args.embedding_lr * batch_lr_scale,
+        scalar_lr=args.scalar_lr * batch_lr_scale,
+        # Muon hyperparameters
+        matrix_lr=args.matrix_lr * batch_lr_scale,
+        weight_decay=weight_decay_scaled,
+    )
+elif args.optimizer == "adamw":
+    if ddp:
+        raise RuntimeError("--optimizer adamw uses torch.optim.AdamW and only supports single-process training")
+    optimizer = model.setup_adamw_optimizer(
+        lr=args.adamw_lr * batch_lr_scale,
+        betas=(args.adamw_beta1, args.adamw_beta2),
+        eps=args.adamw_eps,
+        weight_decay=args.adamw_weight_decay,
+    )
+else:
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
